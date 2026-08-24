@@ -1,0 +1,41 @@
+# --- Env ---
+.env
+.env.*
+!.env.example
+
+# --- Go ---
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/backend/bin/
+/backend/dist/
+vendor/
+go.work
+go.work.sum
+
+# --- Node ---
+node_modules/
+dist/
+build/
+.vite/
+coverage/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+
+# --- IDE / editors ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- OS ---
+.DS_Store
+Thumbs.db
