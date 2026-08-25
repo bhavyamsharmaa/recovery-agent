@@ -5,11 +5,18 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/bhavyamsharmaa/recovery-agent/internal/decide"
 	"github.com/bhavyamsharmaa/recovery-agent/internal/ingest"
 )
 
 func main() {
-	http.Handle("/webhook/payment-failed", ingest.NewHandler())
+	client, err := decide.NewClient()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	http.Handle("/webhook/payment-failed", ingest.NewHandler(client))
 
 	fmt.Println("server up")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
