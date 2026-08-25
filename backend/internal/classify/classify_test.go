@@ -28,8 +28,38 @@ func TestClassify(t *testing.T) {
 			want:        CategoryHardDecline,
 		},
 		{
+			name:        "card expired",
+			errorReason: "card_expired",
+			errorSource: "bank",
+			want:        CategoryHardDecline,
+		},
+		{
+			name:        "payment risk check failed",
+			errorReason: "payment_risk_check_failed",
+			errorSource: "bank",
+			want:        CategoryHardDecline,
+		},
+		{
+			name:        "debit instrument blocked",
+			errorReason: "debit_instrument_blocked",
+			errorSource: "bank",
+			want:        CategoryHardDecline,
+		},
+		{
 			name:        "authentication failed",
 			errorReason: "authentication_failed",
+			errorSource: "customer",
+			want:        CategorySoftDecline,
+		},
+		{
+			name:        "incorrect cvv",
+			errorReason: "incorrect_cvv",
+			errorSource: "customer",
+			want:        CategorySoftDecline,
+		},
+		{
+			name:        "payment timed out",
+			errorReason: "payment_timed_out",
 			errorSource: "customer",
 			want:        CategorySoftDecline,
 		},

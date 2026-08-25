@@ -27,14 +27,19 @@ Rows are listed in match priority order. Anything that matches no row is
 | 1 | `insufficient_funds` | any | `insufficient_funds` |
 | 2 | `bank_technical_error` | any | `bank_downtime` |
 | 3 | `card_declined` | any | `hard_decline` |
-| 4 | `authentication_failed` | any | `soft_decline` |
-| 5 | `gateway_technical_error` | `bank` | `bank_downtime` |
-| 6 | `gateway_technical_error` | `gateway` | `network_error` |
+| 4 | `card_expired` | any | `hard_decline` |
+| 5 | `payment_risk_check_failed` | any | `hard_decline` |
+| 6 | `debit_instrument_blocked` | any | `hard_decline` |
+| 7 | `authentication_failed` | any | `soft_decline` |
+| 8 | `incorrect_cvv` | any | `soft_decline` |
+| 9 | `payment_timed_out` | any | `soft_decline` |
+| 10 | `gateway_technical_error` | `bank` | `bank_downtime` |
+| 11 | `gateway_technical_error` | `gateway` | `network_error` |
 | — | anything else | any | `unknown` |
 
-Rows 5 and 6 are the only case where `error_source` affects the outcome. Every
+Rows 10 and 11 are the only case where `error_source` affects the outcome. Every
 other `error_reason` maps to exactly one category regardless of source, so the
-row order above is descriptive rather than load-bearing — the five direct
+row order above is descriptive rather than load-bearing — the nine direct
 reasons are mutually exclusive.
 
 `gateway_technical_error` with an `error_source` other than `bank` or `gateway`
