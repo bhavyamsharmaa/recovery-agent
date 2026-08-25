@@ -27,6 +27,7 @@ const (
 type DecisionInput struct {
 	Category                string
 	ErrorReason             string
+	PaymentMethod           string // e.g. "card", "upi", "netbanking"
 	AmountPaise             int64
 	AttemptCount            int
 	TimeSinceFailureSeconds int64
@@ -40,6 +41,7 @@ type DecisionInput struct {
 type userPayload struct {
 	Category                string `json:"category"`
 	ErrorReason             string `json:"error_reason"`
+	PaymentMethod           string `json:"payment_method"`
 	AmountPaise             int64  `json:"amount_paise"`
 	AttemptCount            int    `json:"attempt_count"`
 	TimeSinceFailureSeconds int64  `json:"time_since_failure_seconds"`
@@ -52,6 +54,7 @@ func BuildUserMessage(in DecisionInput) string {
 	b, err := json.Marshal(userPayload{
 		Category:                in.Category,
 		ErrorReason:             in.ErrorReason,
+		PaymentMethod:           in.PaymentMethod,
 		AmountPaise:             in.AmountPaise,
 		AttemptCount:            in.AttemptCount,
 		TimeSinceFailureSeconds: in.TimeSinceFailureSeconds,
@@ -71,7 +74,7 @@ func BuildUserMessage(in DecisionInput) string {
 // output in markdown fences during the Day 1 smoke test even when told not to,
 // and only stopped once shown an explicit counter-example.
 func BuildSystemPrompt() string {
-	return schemaRules + "\n\n" + messageConstraints + "\n\n" + fewShotExamples + "\n\n" + formatRule
+	return schemaRules + "\n\n" + hardRules + "\n\n" + messageConstraints + "\n\n" + fewShotExamples + "\n\n" + formatRule
 }
 
 const schemaRules = `You are a payment-failure recovery agent for an Indian payments product. You receive one failed payment as JSON and decide how to recover it.
@@ -93,6 +96,19 @@ The five actions mean:
 - "escalate": automated recovery cannot resolve this; flag it for human review.
 - "no_retry": do not retry and do not escalate.`
 
+// hardRules are stated as rules, not merely demonstrated by the examples.
+// During the first 20-scenario run the examples alone were not enough:
+// three of four hard_decline cases with an exhausted budget drifted to
+// suggest_alternate_method, which would hand a possibly-fraudulent payment
+// another channel with no human ever seeing it.
+const hardRules = `HARD RULES — these are absolute and override any pattern you infer from the examples:
+
+1. If remaining_retry_budget is 0, action MUST be escalate, regardless of category. Never choose suggest_alternate_method or retry_now/retry_delayed when the budget is exhausted — an exhausted budget always means human review, no exceptions.
+
+2. If category is soft_decline and remaining_retry_budget is greater than 0, prefer retry_now or retry_delayed over suggest_alternate_method. Soft declines (wrong CVV, wrong OTP, timed out) are customer-input errors — the customer re-entering the correct value on the SAME method is likely to succeed. Do not suggest switching payment methods before the retry budget for a customer-fixable error is exhausted.
+
+3. Never set alternate_method to the same value as payment_method — suggesting a payment method identical to the one that just failed is not a valid alternative.`
+
 const messageConstraints = `RULES FOR customer_message:
 
 1. Never state a specific timeframe. "shortly" and "we'll notify you" are fine. "within 5 minutes", "in 2 hours", or any numeric time window is not.
@@ -104,17 +120,17 @@ const messageConstraints = `RULES FOR customer_message:
 4. Automatic-retry language is allowed as long as it names no timeframe and promises no outcome. "We'll automatically retry your payment shortly" is correct.`
 
 const fewShotExamples = `Example 1 — input:
-{"category":"insufficient_funds","error_reason":"insufficient_funds","amount_paise":499900,"attempt_count":0,"time_since_failure_seconds":120,"remaining_retry_budget":1}
+{"category":"insufficient_funds","error_reason":"insufficient_funds","payment_method":"card","amount_paise":499900,"attempt_count":0,"time_since_failure_seconds":120,"remaining_retry_budget":1}
 Example 1 — output:
 {"action":"retry_delayed","confidence":0.72,"reasoning":"First failure, funds may not have cleared yet; one retry budget remains, wait before retrying.","customer_message":"We'll automatically retry your payment shortly.","alternate_method":""}
 
 Example 2 — input:
-{"category":"hard_decline","error_reason":"card_declined","amount_paise":1999900,"attempt_count":0,"time_since_failure_seconds":60,"remaining_retry_budget":0}
+{"category":"hard_decline","error_reason":"card_declined","payment_method":"card","amount_paise":1999900,"attempt_count":0,"time_since_failure_seconds":60,"remaining_retry_budget":0}
 Example 2 — output:
 {"action":"escalate","confidence":0.91,"reasoning":"Bank-side hard decline with zero retry budget; retrying an identical card will fail identically, flag for review.","customer_message":"Your payment couldn't be completed. Please try a different card or contact your bank.","alternate_method":""}
 
 Example 3 — input:
-{"category":"bank_downtime","error_reason":"bank_technical_error","amount_paise":800000,"attempt_count":3,"time_since_failure_seconds":5700,"remaining_retry_budget":0}
+{"category":"bank_downtime","error_reason":"bank_technical_error","payment_method":"card","amount_paise":800000,"attempt_count":3,"time_since_failure_seconds":5700,"remaining_retry_budget":0}
 Example 3 — output:
 {"action":"escalate","confidence":0.85,"reasoning":"Bank downtime retry budget exhausted after 3 attempts over 95 minutes; further automated retries unlikely to succeed, escalate for manual review.","customer_message":"We were unable to complete your payment after multiple attempts. Please try a different payment method or contact your bank to confirm your account is active.","alternate_method":""}`
 

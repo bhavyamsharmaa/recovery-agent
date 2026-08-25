@@ -19,26 +19,28 @@ import (
 const delayBetweenCalls = 250 * time.Millisecond
 
 var scenarios = []decide.DecisionInput{
-	{Category: "insufficient_funds", ErrorReason: "insufficient_funds", AmountPaise: 49900, AttemptCount: 0, TimeSinceFailureSeconds: 120, RemainingRetryBudget: 1},
-	{Category: "insufficient_funds", ErrorReason: "insufficient_funds", AmountPaise: 4500000, AttemptCount: 0, TimeSinceFailureSeconds: 300, RemainingRetryBudget: 1},
-	{Category: "insufficient_funds", ErrorReason: "insufficient_funds", AmountPaise: 99900, AttemptCount: 1, TimeSinceFailureSeconds: 1200, RemainingRetryBudget: 0},
-	{Category: "insufficient_funds", ErrorReason: "insufficient_funds", AmountPaise: 1500000, AttemptCount: 1, TimeSinceFailureSeconds: 3600, RemainingRetryBudget: 0},
-	{Category: "bank_downtime", ErrorReason: "bank_technical_error", AmountPaise: 299900, AttemptCount: 0, TimeSinceFailureSeconds: 60, RemainingRetryBudget: 3},
-	{Category: "bank_downtime", ErrorReason: "bank_technical_error", AmountPaise: 1200000, AttemptCount: 1, TimeSinceFailureSeconds: 2100, RemainingRetryBudget: 2},
-	{Category: "bank_downtime", ErrorReason: "bank_technical_error", AmountPaise: 350000, AttemptCount: 2, TimeSinceFailureSeconds: 3900, RemainingRetryBudget: 1},
-	{Category: "bank_downtime", ErrorReason: "bank_technical_error", AmountPaise: 800000, AttemptCount: 3, TimeSinceFailureSeconds: 5700, RemainingRetryBudget: 0},
-	{Category: "hard_decline", ErrorReason: "card_declined", AmountPaise: 199900, AttemptCount: 0, TimeSinceFailureSeconds: 60, RemainingRetryBudget: 0},
-	{Category: "hard_decline", ErrorReason: "payment_risk_check_failed", AmountPaise: 6000000, AttemptCount: 0, TimeSinceFailureSeconds: 120, RemainingRetryBudget: 0},
-	{Category: "hard_decline", ErrorReason: "card_expired", AmountPaise: 79900, AttemptCount: 0, TimeSinceFailureSeconds: 180, RemainingRetryBudget: 0},
-	{Category: "hard_decline", ErrorReason: "debit_instrument_blocked", AmountPaise: 2500000, AttemptCount: 0, TimeSinceFailureSeconds: 60, RemainingRetryBudget: 0},
-	{Category: "soft_decline", ErrorReason: "authentication_failed", AmountPaise: 349900, AttemptCount: 0, TimeSinceFailureSeconds: 30, RemainingRetryBudget: 2},
-	{Category: "soft_decline", ErrorReason: "incorrect_cvv", AmountPaise: 99900, AttemptCount: 1, TimeSinceFailureSeconds: 300, RemainingRetryBudget: 1},
-	{Category: "soft_decline", ErrorReason: "payment_timed_out", AmountPaise: 750000, AttemptCount: 2, TimeSinceFailureSeconds: 480, RemainingRetryBudget: 0},
-	{Category: "network_error", ErrorReason: "gateway_technical_error", AmountPaise: 249900, AttemptCount: 0, TimeSinceFailureSeconds: 60, RemainingRetryBudget: 3},
-	{Category: "network_error", ErrorReason: "gateway_technical_error", AmountPaise: 1800000, AttemptCount: 1, TimeSinceFailureSeconds: 360, RemainingRetryBudget: 2},
-	{Category: "network_error", ErrorReason: "gateway_technical_error", AmountPaise: 499900, AttemptCount: 2, TimeSinceFailureSeconds: 660, RemainingRetryBudget: 1},
-	{Category: "network_error", ErrorReason: "gateway_technical_error", AmountPaise: 99900, AttemptCount: 3, TimeSinceFailureSeconds: 960, RemainingRetryBudget: 0},
-	{Category: "insufficient_funds", ErrorReason: "insufficient_funds", AmountPaise: 9999900, AttemptCount: 0, TimeSinceFailureSeconds: 600, RemainingRetryBudget: 1},
+	{Category: "insufficient_funds", ErrorReason: "insufficient_funds", PaymentMethod: "card", AmountPaise: 49900, AttemptCount: 0, TimeSinceFailureSeconds: 120, RemainingRetryBudget: 1},
+	{Category: "insufficient_funds", ErrorReason: "insufficient_funds", PaymentMethod: "card", AmountPaise: 4500000, AttemptCount: 0, TimeSinceFailureSeconds: 300, RemainingRetryBudget: 1},
+	{Category: "insufficient_funds", ErrorReason: "insufficient_funds", PaymentMethod: "card", AmountPaise: 99900, AttemptCount: 1, TimeSinceFailureSeconds: 1200, RemainingRetryBudget: 0},
+	{Category: "insufficient_funds", ErrorReason: "insufficient_funds", PaymentMethod: "card", AmountPaise: 1500000, AttemptCount: 1, TimeSinceFailureSeconds: 3600, RemainingRetryBudget: 0},
+	{Category: "bank_downtime", ErrorReason: "bank_technical_error", PaymentMethod: "netbanking", AmountPaise: 299900, AttemptCount: 0, TimeSinceFailureSeconds: 60, RemainingRetryBudget: 3},
+	{Category: "bank_downtime", ErrorReason: "bank_technical_error", PaymentMethod: "netbanking", AmountPaise: 1200000, AttemptCount: 1, TimeSinceFailureSeconds: 2100, RemainingRetryBudget: 2},
+	{Category: "bank_downtime", ErrorReason: "bank_technical_error", PaymentMethod: "netbanking", AmountPaise: 350000, AttemptCount: 2, TimeSinceFailureSeconds: 3900, RemainingRetryBudget: 1},
+	// Replaces the original scenario 8, whose input was byte-identical to
+	// few-shot Example 3 and so tested recall rather than judgement.
+	{Category: "bank_downtime", ErrorReason: "bank_technical_error", PaymentMethod: "netbanking", AmountPaise: 1650000, AttemptCount: 3, TimeSinceFailureSeconds: 6300, RemainingRetryBudget: 0},
+	{Category: "hard_decline", ErrorReason: "card_declined", PaymentMethod: "card", AmountPaise: 199900, AttemptCount: 0, TimeSinceFailureSeconds: 60, RemainingRetryBudget: 0},
+	{Category: "hard_decline", ErrorReason: "payment_risk_check_failed", PaymentMethod: "card", AmountPaise: 6000000, AttemptCount: 0, TimeSinceFailureSeconds: 120, RemainingRetryBudget: 0},
+	{Category: "hard_decline", ErrorReason: "card_expired", PaymentMethod: "card", AmountPaise: 79900, AttemptCount: 0, TimeSinceFailureSeconds: 180, RemainingRetryBudget: 0},
+	{Category: "hard_decline", ErrorReason: "debit_instrument_blocked", PaymentMethod: "card", AmountPaise: 2500000, AttemptCount: 0, TimeSinceFailureSeconds: 60, RemainingRetryBudget: 0},
+	{Category: "soft_decline", ErrorReason: "authentication_failed", PaymentMethod: "card", AmountPaise: 349900, AttemptCount: 0, TimeSinceFailureSeconds: 30, RemainingRetryBudget: 2},
+	{Category: "soft_decline", ErrorReason: "incorrect_cvv", PaymentMethod: "card", AmountPaise: 99900, AttemptCount: 1, TimeSinceFailureSeconds: 300, RemainingRetryBudget: 1},
+	{Category: "soft_decline", ErrorReason: "payment_timed_out", PaymentMethod: "card", AmountPaise: 750000, AttemptCount: 2, TimeSinceFailureSeconds: 480, RemainingRetryBudget: 0},
+	{Category: "network_error", ErrorReason: "gateway_technical_error", PaymentMethod: "netbanking", AmountPaise: 249900, AttemptCount: 0, TimeSinceFailureSeconds: 60, RemainingRetryBudget: 3},
+	{Category: "network_error", ErrorReason: "gateway_technical_error", PaymentMethod: "netbanking", AmountPaise: 1800000, AttemptCount: 1, TimeSinceFailureSeconds: 360, RemainingRetryBudget: 2},
+	{Category: "network_error", ErrorReason: "gateway_technical_error", PaymentMethod: "netbanking", AmountPaise: 499900, AttemptCount: 2, TimeSinceFailureSeconds: 660, RemainingRetryBudget: 1},
+	{Category: "network_error", ErrorReason: "gateway_technical_error", PaymentMethod: "netbanking", AmountPaise: 99900, AttemptCount: 3, TimeSinceFailureSeconds: 960, RemainingRetryBudget: 0},
+	{Category: "insufficient_funds", ErrorReason: "insufficient_funds", PaymentMethod: "card", AmountPaise: 9999900, AttemptCount: 0, TimeSinceFailureSeconds: 600, RemainingRetryBudget: 1},
 }
 
 type failure struct {

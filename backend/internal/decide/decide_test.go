@@ -17,7 +17,7 @@ func TestBuildSystemPromptContainsFewShotExamples(t *testing.T) {
 	}{
 		{
 			name: "example 1 input",
-			text: `{"category":"insufficient_funds","error_reason":"insufficient_funds","amount_paise":499900,"attempt_count":0,"time_since_failure_seconds":120,"remaining_retry_budget":1}`,
+			text: `{"category":"insufficient_funds","error_reason":"insufficient_funds","payment_method":"card","amount_paise":499900,"attempt_count":0,"time_since_failure_seconds":120,"remaining_retry_budget":1}`,
 		},
 		{
 			name: "example 1 output",
@@ -25,7 +25,7 @@ func TestBuildSystemPromptContainsFewShotExamples(t *testing.T) {
 		},
 		{
 			name: "example 2 input",
-			text: `{"category":"hard_decline","error_reason":"card_declined","amount_paise":1999900,"attempt_count":0,"time_since_failure_seconds":60,"remaining_retry_budget":0}`,
+			text: `{"category":"hard_decline","error_reason":"card_declined","payment_method":"card","amount_paise":1999900,"attempt_count":0,"time_since_failure_seconds":60,"remaining_retry_budget":0}`,
 		},
 		{
 			name: "example 2 output",
@@ -33,7 +33,7 @@ func TestBuildSystemPromptContainsFewShotExamples(t *testing.T) {
 		},
 		{
 			name: "example 3 input",
-			text: `{"category":"bank_downtime","error_reason":"bank_technical_error","amount_paise":800000,"attempt_count":3,"time_since_failure_seconds":5700,"remaining_retry_budget":0}`,
+			text: `{"category":"bank_downtime","error_reason":"bank_technical_error","payment_method":"card","amount_paise":800000,"attempt_count":3,"time_since_failure_seconds":5700,"remaining_retry_budget":0}`,
 		},
 		{
 			name: "example 3 output",
@@ -117,17 +117,53 @@ func TestBuildSystemPromptContainsMessageConstraints(t *testing.T) {
 	}
 }
 
+// The hard rules exist because the examples alone did not hold — assert each is
+// actually present, not merely implied.
+func TestBuildSystemPromptContainsHardRules(t *testing.T) {
+	prompt := BuildSystemPrompt()
+
+	fragments := []string{
+		"If remaining_retry_budget is 0, action MUST be escalate",
+		"no exceptions",
+		"prefer retry_now or retry_delayed over suggest_alternate_method",
+		"customer re-entering the correct value on the SAME method",
+		"Never set alternate_method to the same value as payment_method",
+	}
+
+	for _, f := range fragments {
+		if !strings.Contains(prompt, f) {
+			t.Errorf("hard rules are missing %q", f)
+		}
+	}
+}
+
+// The rules must be stated before the examples, so an example never reads as
+// the authority on a case a rule covers.
+func TestHardRulesPrecedeExamples(t *testing.T) {
+	prompt := BuildSystemPrompt()
+
+	rules := strings.Index(prompt, "HARD RULES")
+	first := strings.Index(prompt, "Example 1 — input:")
+	if rules == -1 || first == -1 {
+		t.Fatal("expected both a hard rules block and few-shot examples")
+	}
+	if rules > first {
+		t.Error("hard rules appear after the examples; they must come first")
+	}
+}
+
 func TestBuildUserMessage(t *testing.T) {
 	got := BuildUserMessage(DecisionInput{
 		Category:                "insufficient_funds",
 		ErrorReason:             "insufficient_funds",
+		PaymentMethod:           "card",
 		AmountPaise:             499900,
 		AttemptCount:            0,
 		TimeSinceFailureSeconds: 120,
 		RemainingRetryBudget:    1,
 	})
 
-	want := `{"category":"insufficient_funds","error_reason":"insufficient_funds","amount_paise":499900,"attempt_count":0,"time_since_failure_seconds":120,"remaining_retry_budget":1}`
+	want := `{"category":"insufficient_funds","error_reason":"insufficient_funds","payment_method":"card","amount_paise":499900,"attempt_count":0,"time_since_failure_seconds":120,"remaining_retry_budget":1}`
 	if got != want {
 		t.Errorf("BuildUserMessage()\n got: %s\nwant: %s", got, want)
 	}
@@ -139,6 +175,7 @@ func TestBuildUserMessageMatchesFewShotInputShape(t *testing.T) {
 	got := BuildUserMessage(DecisionInput{
 		Category:                "hard_decline",
 		ErrorReason:             "card_declined",
+		PaymentMethod:           "card",
 		AmountPaise:             1999900,
 		AttemptCount:            0,
 		TimeSinceFailureSeconds: 60,
