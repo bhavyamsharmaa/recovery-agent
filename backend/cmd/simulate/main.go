@@ -137,6 +137,7 @@ func main() {
 	scenario := flag.String("scenario", "insufficient_funds", "insufficient_funds | bank_downtime | hard_decline | soft_decline | network_error | duplicate | random")
 	count := flag.Int("count", 1, "number of webhooks to send")
 	eventID := flag.String("event-id", "", "reuse this exact event id for every call; empty generates a fresh one per call")
+	paymentID := flag.String("payment-id", "", "reuse this exact payment id for every call while event ids stay fresh; empty generates a fresh one per call")
 	flag.Parse()
 
 	if *scenario != "random" {
@@ -161,7 +162,7 @@ func main() {
 		if fixedID == "" {
 			fixedID = razorpayID("evt")
 		}
-		fixedBody = mustMarshal(build("duplicate"))
+		fixedBody = mustMarshal(build("duplicate", *paymentID))
 	}
 
 	failures := 0
@@ -180,7 +181,7 @@ func main() {
 			if id == "" {
 				id = razorpayID("evt")
 			}
-			body = mustMarshal(build(name))
+			body = mustMarshal(build(name, *paymentID))
 		}
 
 		status, err := send(*url, id, body)
@@ -201,9 +202,17 @@ func main() {
 	}
 }
 
-func build(name string) event {
+// build renders one event. A non-empty paymentID is reused verbatim, which is
+// what lets the same payment be delivered repeatedly under fresh event ids —
+// the shape of a payment that fails again, as opposed to a redelivery of one
+// failure, which is what --scenario duplicate produces.
+func build(name, paymentID string) event {
 	s := scenarios[name]
 	now := time.Now().Unix()
+
+	if paymentID == "" {
+		paymentID = razorpayID("pay")
+	}
 
 	var e event
 	e.AccountID = "acc_BFQ7uQEaa7j2z7"
@@ -212,7 +221,7 @@ func build(name string) event {
 	e.Entity = "event"
 	e.Event = "payment.failed"
 	e.Payload.Payment.Entity = paymentEntity{
-		ID:               razorpayID("pay"),
+		ID:               paymentID,
 		Amount:           (rand.Intn(50000-100+1) + 100) * 100, // 100-50000 INR, sent as paise
 		Currency:         "INR",
 		Status:           "failed",

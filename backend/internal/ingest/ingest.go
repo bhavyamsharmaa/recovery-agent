@@ -62,17 +62,29 @@ type PaymentEntity struct {
 	OrderID          string `json:"order_id"`
 }
 
+// eventIDHeader is where Razorpay carries the id of the webhook delivery. It
+// is the only stable handle a receiver has for recognising a redelivery. The
+// payment id is not one: a payment that fails a second time genuinely produces
+// a second event, which must be counted as an attempt rather than dropped.
+const eventIDHeader = "X-Razorpay-Event-Id"
+
 // Handler serves POST /webhook/payment-failed.
 type Handler struct {
-	// seen holds every payment id processed so far. In-memory only: a restart
+	// seen holds every event id processed so far. In-memory only: a restart
 	// forgets everything and redeliveries would be reprocessed. Day 5 replaces
 	// this with the database.
 	seen sync.Map
 
-	decider Decider
+	attempts AttemptStore
+	decider  Decider
 }
 
-func NewHandler(d Decider) *Handler { return &Handler{decider: d} }
+// NewHandler takes the AttemptStore interface rather than a concrete store, so
+// Day 5's Postgres implementation drops in at the construction site without
+// this package changing.
+func NewHandler(d Decider, a AttemptStore) *Handler {
+	return &Handler{decider: d, attempts: a}
+}
 
 type receivedLog struct {
 	Event       string            `json:"event"`
@@ -112,8 +124,21 @@ type decisionRetryLog struct {
 
 type duplicateLog struct {
 	Event     string `json:"event"`
+	EventID   string `json:"event_id"`
 	PaymentID string `json:"payment_id"`
 	TS        string `json:"ts"`
+}
+
+// stoppingRuleLog records a payment stopped before the decision layer was
+// consulted. It carries no decision fields because no decision was made.
+type stoppingRuleLog struct {
+	Event            string            `json:"event"`
+	PaymentID        string            `json:"payment_id"`
+	Category         classify.Category `json:"category"`
+	AttemptCount     int               `json:"attempt_count"`
+	Budget           int               `json:"budget"`
+	EscalationReason string            `json:"escalation_reason"`
+	TS               string            `json:"ts"`
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -129,8 +154,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The idempotency key is the payment id, not e.Event — that field holds the
-	// event *type* ("payment.failed") and is identical across every webhook.
 	p := e.Payload.Payment.Entity
 	if p.ID == "" {
 		fmt.Fprintln(os.Stderr, "webhook parsed but payload.payment.entity.id was empty")
@@ -138,20 +161,62 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// LoadOrStore is one atomic step. A Load-then-Store pair would let two
-	// concurrent redeliveries of the same payment both read "not seen" and both
-	// be treated as new, which is the exact failure this check exists to prevent.
-	if _, loaded := h.seen.LoadOrStore(p.ID, struct{}{}); loaded {
-		logLine(duplicateLog{
-			Event:     "duplicate",
-			PaymentID: p.ID,
-			TS:        now(),
+	// The idempotency key is the delivery's event id, not the payment id and not
+	// e.Event — that field holds the event *type* ("payment.failed") and is
+	// identical across every webhook. Keying on the payment id would conflate a
+	// redelivery of one failure with a genuine second failure of the same
+	// payment, and the second is exactly what the attempt counter below exists
+	// to count.
+	//
+	// A delivery with no event id header cannot be deduplicated, so it is
+	// processed rather than dropped. Dropping it would lose a real failure; the
+	// retry budget still bounds what happens next.
+	eventID := r.Header.Get(eventIDHeader)
+	if eventID != "" {
+		// LoadOrStore is one atomic step. A Load-then-Store pair would let two
+		// concurrent redeliveries of the same event both read "not seen" and both
+		// be treated as new, which is the exact failure this check exists to
+		// prevent.
+		if _, loaded := h.seen.LoadOrStore(eventID, struct{}{}); loaded {
+			logLine(duplicateLog{
+				Event:     "duplicate",
+				EventID:   eventID,
+				PaymentID: p.ID,
+				TS:        now(),
+			})
+			ok(w)
+			return
+		}
+	}
+
+	category := classify.Classify(p.ErrorReason, p.ErrorSource)
+
+	// Attempts are counted per payment id — how many times THIS payment has been
+	// seen — not per category. Counting happens before the budget check so that
+	// a stopped payment still records the attempt that tripped the rule.
+	attemptCount := h.attempts.Increment(p.ID)
+
+	// A category absent from the table budgets 0, which is the safe direction:
+	// hard_decline and unknown both land here and both must stop.
+	budget := retryBudgets[category]
+
+	// The stopping rule runs before the decision layer, not after. Once the
+	// budget is spent there is no automated action left to take on this payment,
+	// so asking the model would spend a call on a question whose answer cannot
+	// be used.
+	if attemptCount > budget {
+		logLine(stoppingRuleLog{
+			Event:            "stopping_rule_triggered",
+			PaymentID:        p.ID,
+			Category:         category,
+			AttemptCount:     attemptCount,
+			Budget:           budget,
+			EscalationReason: "retry_budget_exhausted",
+			TS:               now(),
 		})
 		ok(w)
 		return
 	}
-
-	category := classify.Classify(p.ErrorReason, p.ErrorSource)
 
 	received := receivedLog{
 		Event:       "payment_received",
@@ -175,11 +240,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			PaymentMethod: p.Method,
 			AmountPaise:   int64(p.Amount),
 
-			// TODO(day5): replace with real values once persistence exists.
-			AttemptCount:            0,
-			TimeSinceFailureSeconds: 0,
+			AttemptCount: attemptCount,
 
-			RemainingRetryBudget: retryBudgets[category],
+			// Remaining counts the retries still available after this sighting.
+			// The stopping rule above guarantees attemptCount <= budget here, so
+			// this never goes negative.
+			RemainingRetryBudget: budget - (attemptCount - 1),
+
+			// TODO(day5): needs the timestamp of the first failure, which needs
+			// persistence.
+			TimeSinceFailureSeconds: 0,
 		})
 		cancel()
 

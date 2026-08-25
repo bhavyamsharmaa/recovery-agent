@@ -16,7 +16,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	http.Handle("/webhook/payment-failed", ingest.NewHandler(client))
+	// The concrete store is constructed once, here. Every other file depends on
+	// the ingest.AttemptStore interface, so Day 5 swaps this line alone.
+	attempts := ingest.NewInMemoryAttemptStore()
+
+	http.Handle("/webhook/payment-failed", ingest.NewHandler(client, attempts))
 
 	fmt.Println("server up")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
