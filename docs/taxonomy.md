@@ -17,19 +17,24 @@ Once `remaining_retry_budget` reaches 0, no further automated retry happens on t
 same method, in any category. What happens instead depends on whether the failure
 carries fraud risk:
 
-| Category at budget 0 | Allowed actions |
+| Category at budget 0 | Action |
 |---|---|
-| `hard_decline`, `unknown` | `escalate` only |
-| `insufficient_funds`, `bank_downtime`, `soft_decline`, `network_error` | `suggest_alternate_method` or `escalate` |
+| `hard_decline`, `unknown` | `escalate` only — no exceptions |
+| `insufficient_funds` | prefer `suggest_alternate_method` |
+| `bank_downtime`, `soft_decline`, `network_error` | `escalate` as the default |
 
 `hard_decline` and `unknown` are restricted to `escalate` because a hard decline may
 be a fraud flag, a blocked card, or a failed risk check, and `unknown` means no rule
 matched at all. Offering either a different payment channel without human review
 would hand a possibly-fraudulent payment a second avenue to succeed.
 
-The other four carry no such risk. A customer whose balance was low, or whose bank
-was briefly down, is free to pay another way — which is why `insufficient_funds`
-prefers `suggest_alternate_method` once its single retry is spent.
+`insufficient_funds` carries no such risk — the card is not compromised, the customer
+has simply run out of attempts on it — so a different method is worth offering before
+spending a human's time.
+
+For the remaining three, `escalate` is a fallback rather than a fraud-risk rule: there
+is no strong signal that switching methods helps when the failure was on the bank or
+gateway side, so a human looks first.
 
 ## Category → decline code mapping
 

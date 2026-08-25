@@ -124,9 +124,11 @@ func TestBuildSystemPromptContainsHardRules(t *testing.T) {
 
 	fragments := []string{
 		"If remaining_retry_budget is 0, never choose retry_now or retry_delayed",
-		"action MUST be escalate. Never choose suggest_alternate_method for these two categories",
-		"These categories carry no fraud risk",
-		"No exceptions.",
+		"action MUST be escalate — no exceptions",
+		"carry fraud/compliance risk",
+		"prefer suggest_alternate_method over escalate",
+		"escalate is the safe default",
+		"not a fraud-risk rule",
 		"prefer retry_now or retry_delayed over suggest_alternate_method",
 		"customer re-entering the correct value on the SAME method",
 		"Set alternate_method ONLY when action is suggest_alternate_method",
