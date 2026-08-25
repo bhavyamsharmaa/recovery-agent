@@ -35,7 +35,7 @@ var retryBudgets = map[classify.Category]int{
 // Decider is the decision layer as this package needs it. An interface rather
 // than a concrete client so the handler can be tested without an API key.
 type Decider interface {
-	Decide(ctx context.Context, in decide.DecisionInput) (decide.Decision, string, error)
+	Decide(ctx context.Context, in decide.DecisionInput) (decide.Decision, decide.Outcome, error)
 }
 
 // Event is Razorpay's payment.failed webhook envelope. Only the fields we
@@ -100,6 +100,16 @@ type decisionFailedLog struct {
 	TS        string            `json:"ts"`
 }
 
+// decisionRetryLog records that the model had to be asked twice. Decide() does
+// not know the payment id, so it reports only that a retry happened and the
+// handler — which owns the id — writes the line.
+type decisionRetryLog struct {
+	Event     string `json:"event"`
+	PaymentID string `json:"payment_id"`
+	Reason    string `json:"reason"`
+	TS        string `json:"ts"`
+}
+
 type duplicateLog struct {
 	Event     string `json:"event"`
 	PaymentID string `json:"payment_id"`
@@ -156,9 +166,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// An unknown category means no rule matched, so there is nothing to reason
 	// from. Asking the model anyway would be inviting a guess.
 	var decideErr error
+	var decideRetried bool
 	if category != classify.CategoryUnknown {
 		ctx, cancel := context.WithTimeout(r.Context(), decideTimeout)
-		d, _, err := h.decider.Decide(ctx, decide.DecisionInput{
+		d, outcome, err := h.decider.Decide(ctx, decide.DecisionInput{
 			Category:      string(category),
 			ErrorReason:   p.ErrorReason,
 			PaymentMethod: p.Method,
@@ -172,6 +183,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 		cancel()
 
+		decideRetried = outcome.Retried
 		if err != nil {
 			decideErr = err
 		} else {
@@ -183,6 +195,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	logLine(received)
+
+	// Logged whether or not the second attempt succeeded — a rising retry rate is
+	// worth seeing even while the outcomes stay good.
+	if decideRetried {
+		logLine(decisionRetryLog{
+			Event:     "decision_retry",
+			PaymentID: p.ID,
+			Reason:    "parse_error",
+			TS:        now(),
+		})
+	}
 
 	// A failed decision is logged and dropped. Razorpay retries any non-2xx, so
 	// failing the webhook because the model was unavailable would just produce

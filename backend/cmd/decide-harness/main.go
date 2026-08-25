@@ -57,6 +57,7 @@ func main() {
 
 	ctx := context.Background()
 	var failures []failure
+	retried := 0
 
 	for i, in := range scenarios {
 		n := i + 1
@@ -67,15 +68,19 @@ func main() {
 		fmt.Printf("========== SCENARIO %d/%d ==========\n", n, len(scenarios))
 		fmt.Printf("input: %s\n", decide.BuildUserMessage(in))
 
-		d, raw, err := client.Decide(ctx, in)
+		d, out, err := client.Decide(ctx, in)
 
 		// Printed on every path. A rejected response is only diagnosable if you
 		// can see exactly what the model said.
-		fmt.Printf("raw response:\n%s\n", raw)
+		fmt.Printf("raw response:\n%s\n", out.Raw)
+		if out.Retried {
+			fmt.Println("(first attempt did not parse; this is the retry)")
+			retried++
+		}
 
 		if err != nil {
 			fmt.Printf("FAIL: %v\n\n", err)
-			failures = append(failures, failure{scenario: n, reason: describeFailure(err, raw)})
+			failures = append(failures, failure{scenario: n, reason: describeFailure(err, out.Raw)})
 			continue
 		}
 
@@ -91,6 +96,7 @@ func main() {
 	passed := len(scenarios) - len(failures)
 	fmt.Println("========== SUMMARY ==========")
 	fmt.Printf("%d/%d scenarios produced valid, schema-conformant decisions.\n", passed, len(scenarios))
+	fmt.Printf("%d of %d needed a retry after an unparseable first response.\n", retried, len(scenarios))
 
 	if len(failures) == 0 {
 		fmt.Println("No failures.")

@@ -47,12 +47,12 @@ func TestDecideParsesValidResponse(t *testing.T) {
 
 	c := newTestClient(t, respondWith(text))
 
-	d, raw, err := c.Decide(context.Background(), sampleInput)
+	d, out, err := c.Decide(context.Background(), sampleInput)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if raw != text {
-		t.Errorf("raw text\n got: %s\nwant: %s", raw, text)
+	if out.Raw != text {
+		t.Errorf("raw text\n got: %s\nwant: %s", out.Raw, text)
 	}
 	if d.Action != ActionRetryDelayed {
 		t.Errorf("Action = %q, want %q", d.Action, ActionRetryDelayed)
@@ -75,12 +75,12 @@ func TestDecideMalformedJSONReturnsErrorWithRawText(t *testing.T) {
 
 	c := newTestClient(t, respondWith(text))
 
-	_, raw, err := c.Decide(context.Background(), sampleInput)
+	_, out, err := c.Decide(context.Background(), sampleInput)
 	if err == nil {
 		t.Fatal("expected an error for fenced JSON, got nil")
 	}
-	if raw != text {
-		t.Errorf("raw text was not preserved on failure\n got: %s\nwant: %s", raw, text)
+	if out.Raw != text {
+		t.Errorf("raw text was not preserved on failure\n got: %s\nwant: %s", out.Raw, text)
 	}
 	if !strings.Contains(err.Error(), "unmarshal decision") {
 		t.Errorf("error = %v, want an unmarshal failure", err)
@@ -93,12 +93,12 @@ func TestDecideRejectsOutOfRangeConfidence(t *testing.T) {
 
 	c := newTestClient(t, respondWith(text))
 
-	_, raw, err := c.Decide(context.Background(), sampleInput)
+	_, out, err := c.Decide(context.Background(), sampleInput)
 	if err == nil {
 		t.Fatal("expected a validation error for confidence 1.5, got nil")
 	}
-	if raw != text {
-		t.Errorf("raw text was not preserved on validation failure: %s", raw)
+	if out.Raw != text {
+		t.Errorf("raw text was not preserved on validation failure: %s", out.Raw)
 	}
 	if !strings.Contains(err.Error(), "out of range") {
 		t.Errorf("error = %v, want an out-of-range failure", err)
@@ -122,15 +122,15 @@ func TestDecideRejectsInventedAction(t *testing.T) {
 
 	c := newTestClient(t, respondWith(text))
 
-	_, raw, err := c.Decide(context.Background(), sampleInput)
+	_, out, err := c.Decide(context.Background(), sampleInput)
 	if err == nil {
 		t.Fatal("expected a validation error for an unknown action, got nil")
 	}
 	if !strings.Contains(err.Error(), "invalid action") {
 		t.Errorf("error = %v, want an invalid-action failure", err)
 	}
-	if raw != text {
-		t.Errorf("raw text was not preserved: %s", raw)
+	if out.Raw != text {
+		t.Errorf("raw text was not preserved: %s", out.Raw)
 	}
 }
 
@@ -142,15 +142,15 @@ func TestDecideRejectsAlternateMethodOnNonSuggestAction(t *testing.T) {
 
 	c := newTestClient(t, respondWith(text))
 
-	_, raw, err := c.Decide(context.Background(), sampleInput)
+	_, out, err := c.Decide(context.Background(), sampleInput)
 	if err == nil {
 		t.Fatal("expected an error for alternate_method on escalate, got nil")
 	}
 	if !strings.Contains(err.Error(), "must be empty") {
 		t.Errorf("error = %v, want a must-be-empty failure", err)
 	}
-	if raw != text {
-		t.Errorf("raw text was not preserved: %s", raw)
+	if out.Raw != text {
+		t.Errorf("raw text was not preserved: %s", out.Raw)
 	}
 }
 
@@ -204,6 +204,160 @@ func TestDecideAcceptsValidSuggestAlternateMethod(t *testing.T) {
 	}
 }
 
+// respondInSequence returns each text in turn, and reports how many requests
+// were made so a test can prove no third attempt happened.
+func respondInSequence(texts ...string) (http.HandlerFunc, *int) {
+	calls := 0
+	return func(w http.ResponseWriter, r *http.Request) {
+		i := calls
+		calls++
+		if i >= len(texts) {
+			// A call past the end means the retry bound leaked.
+			w.WriteHeader(http.StatusTeapot)
+			return
+		}
+		respondWith(texts[i])(w, r)
+	}, &calls
+}
+
+// The live failure this retry exists for: Haiku fenced its output once, then
+// answered correctly when asked again.
+func TestDecideRetriesOnceOnParseFailure(t *testing.T) {
+	const fenced = "```json\n{\"action\":\"retry_now\",\"confidence\":0.8,\"reasoning\":\"r\",\"customer_message\":\"m\"}\n```"
+	const valid = `{"action":"retry_delayed","confidence":0.72,"reasoning":"r","customer_message":"m","alternate_method":""}`
+
+	handler, calls := respondInSequence(fenced, valid)
+	c := newTestClient(t, handler)
+
+	d, out, err := c.Decide(context.Background(), sampleInput)
+	if err != nil {
+		t.Fatalf("expected the retry to succeed, got: %v", err)
+	}
+	if d.Action != ActionRetryDelayed {
+		t.Errorf("Action = %q, want the retry's %q", d.Action, ActionRetryDelayed)
+	}
+	if !out.Retried {
+		t.Error("Outcome.Retried = false, want true")
+	}
+	if out.Raw != valid {
+		t.Errorf("Outcome.Raw is not the retry's text\n got: %s\nwant: %s", out.Raw, valid)
+	}
+	if *calls != 2 {
+		t.Errorf("made %d requests, want exactly 2", *calls)
+	}
+}
+
+func TestDecideDoesNotRetryMoreThanOnce(t *testing.T) {
+	// Two different malformed bodies, so the error and raw text identify which
+	// attempt they came from.
+	const first = "```json\n{\"action\":\"retry_now\",\"confidence\":0.8}\n```"
+	const second = `Here is the decision: {"action":"retry_now","confidence":0.8}`
+
+	handler, calls := respondInSequence(first, second)
+	c := newTestClient(t, handler)
+
+	_, out, err := c.Decide(context.Background(), sampleInput)
+	if err == nil {
+		t.Fatal("expected an error when both attempts fail, got nil")
+	}
+	if *calls != 2 {
+		t.Errorf("made %d requests, want exactly 2 — no third attempt", *calls)
+	}
+	if out.Raw != second {
+		t.Errorf("Outcome.Raw is not the second attempt's text\n got: %s\nwant: %s", out.Raw, second)
+	}
+	if out.Raw == first {
+		t.Error("Outcome.Raw is the first attempt's text; it must be the second's")
+	}
+	if !out.Retried {
+		t.Error("Outcome.Retried = false, want true")
+	}
+}
+
+// A validation failure is a format failure too — the response parsed but was
+// not a usable Decision.
+func TestDecideRetriesOnValidationFailure(t *testing.T) {
+	const badConfidence = `{"action":"retry_now","confidence":1.5,"reasoning":"r","customer_message":"m"}`
+	const valid = `{"action":"escalate","confidence":0.9,"reasoning":"r","customer_message":"m","alternate_method":""}`
+
+	handler, calls := respondInSequence(badConfidence, valid)
+	c := newTestClient(t, handler)
+
+	d, out, err := c.Decide(context.Background(), sampleInput)
+	if err != nil {
+		t.Fatalf("expected the retry to succeed, got: %v", err)
+	}
+	if d.Action != ActionEscalate {
+		t.Errorf("Action = %q, want %q", d.Action, ActionEscalate)
+	}
+	if !out.Retried {
+		t.Error("Outcome.Retried = false, want true")
+	}
+	if *calls != 2 {
+		t.Errorf("made %d requests, want exactly 2", *calls)
+	}
+}
+
+// Retrying a real outage would bill the API twice for nothing, so non-200s are
+// deliberately not retried.
+func TestDecideDoesNotRetryOnNonOKStatus(t *testing.T) {
+	calls := 0
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusUnauthorized)
+		io.WriteString(w, `{"type":"error"}`)
+	})
+
+	_, out, err := c.Decide(context.Background(), sampleInput)
+	if err == nil {
+		t.Fatal("expected an error for HTTP 401, got nil")
+	}
+	if calls != 1 {
+		t.Errorf("made %d requests, want exactly 1 — a non-200 must not be retried", calls)
+	}
+	if out.Retried {
+		t.Error("Outcome.Retried = true, want false for a non-format failure")
+	}
+}
+
+func TestDecideDoesNotRetryOnCancelledContext(t *testing.T) {
+	calls := 0
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		respondWith(`{"action":"no_retry","confidence":0.5,"reasoning":"r","customer_message":"m"}`)(w, r)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, _, err := c.Decide(ctx, sampleInput); err == nil {
+		t.Fatal("expected an error for a cancelled context, got nil")
+	}
+	if calls != 0 {
+		t.Errorf("made %d requests, want 0 — a cancelled context must not be retried", calls)
+	}
+}
+
+// A response that parses on the first attempt must not trigger a second call.
+func TestDecideDoesNotRetryOnSuccess(t *testing.T) {
+	calls := 0
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		respondWith(`{"action":"retry_now","confidence":0.8,"reasoning":"r","customer_message":"m"}`)(w, r)
+	})
+
+	_, out, err := c.Decide(context.Background(), sampleInput)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("made %d requests, want exactly 1", calls)
+	}
+	if out.Retried {
+		t.Error("Outcome.Retried = true on a first-attempt success")
+	}
+}
+
 func TestDecideNonOKStatusPreservesBody(t *testing.T) {
 	const body = `{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}`
 
@@ -212,12 +366,12 @@ func TestDecideNonOKStatusPreservesBody(t *testing.T) {
 		io.WriteString(w, body)
 	})
 
-	_, raw, err := c.Decide(context.Background(), sampleInput)
+	_, out, err := c.Decide(context.Background(), sampleInput)
 	if err == nil {
 		t.Fatal("expected an error for HTTP 401, got nil")
 	}
-	if raw != body {
-		t.Errorf("error body was not preserved\n got: %s\nwant: %s", raw, body)
+	if out.Raw != body {
+		t.Errorf("error body was not preserved\n got: %s\nwant: %s", out.Raw, body)
 	}
 }
 

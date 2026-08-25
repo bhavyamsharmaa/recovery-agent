@@ -60,14 +60,45 @@ type apiResponse struct {
 	StopReason string `json:"stop_reason"`
 }
 
+// errFormat marks the one failure class worth asking again about: a response
+// arrived intact but its content was not a usable Decision. Network failures,
+// cancellations and non-200s are deliberately excluded — retrying those blindly
+// bills the API twice during a real outage.
+var errFormat = errors.New("format")
+
+// Outcome carries what the caller needs to know about how the answer was
+// obtained, separate from the answer itself.
+type Outcome struct {
+	// Raw is the response text of the final attempt — the retry's text when a
+	// retry happened, not the first attempt's.
+	Raw string
+
+	// Retried is true when the first attempt produced an unusable response and a
+	// second was made. It says nothing about whether the second succeeded.
+	Retried bool
+}
+
 // Decide asks the model what to do about one failed payment.
 //
-// The second return value is the raw text we tried to parse, and it is returned
-// on every path where we have it — including failures. A rejected decision is
-// only debuggable if you can see what the model actually said.
+// A response that arrives but does not parse or validate is retried exactly
+// once, unchanged. Two failures return the second attempt's error. There is no
+// third attempt and no fallback decision — deciding what to do when the model
+// cannot answer is not this function's job.
 //
 // No timeout is set here; cancellation is the caller's job via ctx.
-func (c *Client) Decide(ctx context.Context, in DecisionInput) (Decision, string, error) {
+func (c *Client) Decide(ctx context.Context, in DecisionInput) (Decision, Outcome, error) {
+	d, raw, err := c.attempt(ctx, in)
+	if err == nil || !errors.Is(err, errFormat) {
+		return d, Outcome{Raw: raw}, err
+	}
+
+	d, raw, err = c.attempt(ctx, in)
+	return d, Outcome{Raw: raw, Retried: true}, err
+}
+
+// attempt performs exactly one request and reports whether the failure was a
+// format failure via errFormat.
+func (c *Client) attempt(ctx context.Context, in DecisionInput) (Decision, string, error) {
 	body, err := json.Marshal(apiRequest{
 		Model:     model,
 		MaxTokens: maxTokens,
@@ -115,10 +146,10 @@ func (c *Client) Decide(ctx context.Context, in DecisionInput) (Decision, string
 
 	var d Decision
 	if err := json.Unmarshal([]byte(text), &d); err != nil {
-		return Decision{}, text, fmt.Errorf("decide: unmarshal decision: %w", err)
+		return Decision{}, text, fmt.Errorf("decide: unmarshal decision: %v: %w", err, errFormat)
 	}
 	if err := validate(d, in); err != nil {
-		return d, text, err
+		return d, text, fmt.Errorf("%v: %w", err, errFormat)
 	}
 	return d, text, nil
 }
