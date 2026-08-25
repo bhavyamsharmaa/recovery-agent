@@ -123,11 +123,14 @@ func TestBuildSystemPromptContainsHardRules(t *testing.T) {
 	prompt := BuildSystemPrompt()
 
 	fragments := []string{
-		"If remaining_retry_budget is 0, action MUST be escalate",
-		"no exceptions",
+		"If remaining_retry_budget is 0, never choose retry_now or retry_delayed",
+		"action MUST be escalate. Never choose suggest_alternate_method for these two categories",
+		"These categories carry no fraud risk",
+		"No exceptions.",
 		"prefer retry_now or retry_delayed over suggest_alternate_method",
 		"customer re-entering the correct value on the SAME method",
-		"Never set alternate_method to the same value as payment_method",
+		"Set alternate_method ONLY when action is suggest_alternate_method",
+		"it must never equal payment_method",
 	}
 
 	for _, f := range fragments {

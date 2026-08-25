@@ -11,6 +11,26 @@
 | `network_error` | 3 | 5 min apart | Razorpay's own gateway-side hiccup, distinct from bank downtime — clears faster, so shorter spacing. |
 | `unknown` | 0 | n/a | No classification rule matched — retrying blind risks acting on a failure mode we don't understand. Always escalate for human review rather than guess. |
 
+### What an exhausted budget means
+
+Once `remaining_retry_budget` reaches 0, no further automated retry happens on the
+same method, in any category. What happens instead depends on whether the failure
+carries fraud risk:
+
+| Category at budget 0 | Allowed actions |
+|---|---|
+| `hard_decline`, `unknown` | `escalate` only |
+| `insufficient_funds`, `bank_downtime`, `soft_decline`, `network_error` | `suggest_alternate_method` or `escalate` |
+
+`hard_decline` and `unknown` are restricted to `escalate` because a hard decline may
+be a fraud flag, a blocked card, or a failed risk check, and `unknown` means no rule
+matched at all. Offering either a different payment channel without human review
+would hand a possibly-fraudulent payment a second avenue to succeed.
+
+The other four carry no such risk. A customer whose balance was low, or whose bank
+was briefly down, is free to pay another way — which is why `insufficient_funds`
+prefers `suggest_alternate_method` once its single retry is spent.
+
 ## Category → decline code mapping
 
 Matching uses `error_reason` as the primary key and `error_source` only as a

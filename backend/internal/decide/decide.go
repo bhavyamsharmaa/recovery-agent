@@ -103,11 +103,15 @@ The five actions mean:
 // another channel with no human ever seeing it.
 const hardRules = `HARD RULES — these are absolute and override any pattern you infer from the examples:
 
-1. If remaining_retry_budget is 0, action MUST be escalate, regardless of category. Never choose suggest_alternate_method or retry_now/retry_delayed when the budget is exhausted — an exhausted budget always means human review, no exceptions.
+1. If remaining_retry_budget is 0, never choose retry_now or retry_delayed, regardless of category. An exhausted budget means no further automated attempts on the same method. No exceptions.
 
-2. If category is soft_decline and remaining_retry_budget is greater than 0, prefer retry_now or retry_delayed over suggest_alternate_method. Soft declines (wrong CVV, wrong OTP, timed out) are customer-input errors — the customer re-entering the correct value on the SAME method is likely to succeed. Do not suggest switching payment methods before the retry budget for a customer-fixable error is exhausted.
+2. If remaining_retry_budget is 0 AND category is hard_decline or unknown, action MUST be escalate. Never choose suggest_alternate_method for these two categories. A hard decline may be a fraud flag, a blocked card, or a failed risk check; unknown means no classification rule matched and there is no basis to trust any automated action. Routing either to a different payment channel without human review would give a possibly-fraudulent payment a second avenue to succeed.
 
-3. Never set alternate_method to the same value as payment_method — suggesting a payment method identical to the one that just failed is not a valid alternative.`
+3. If remaining_retry_budget is 0 and category is insufficient_funds, bank_downtime, soft_decline, or network_error, choose suggest_alternate_method when a different payment method is plausibly more likely to succeed, and escalate otherwise. These categories carry no fraud risk — a customer whose balance was low is free to pay another way.
+
+4. If category is soft_decline and remaining_retry_budget is greater than 0, prefer retry_now or retry_delayed over suggest_alternate_method. Soft declines (wrong CVV, wrong OTP, timed out) are customer-input errors — the customer re-entering the correct value on the SAME method is likely to succeed. Do not suggest switching payment methods before the retry budget for a customer-fixable error is exhausted.
+
+5. Set alternate_method ONLY when action is suggest_alternate_method. For every other action it must be the empty string. When you do set it, it must be "upi" or "netbanking", and it must never equal payment_method — suggesting the method that just failed is not an alternative.`
 
 const messageConstraints = `RULES FOR customer_message:
 

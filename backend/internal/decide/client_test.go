@@ -134,6 +134,76 @@ func TestDecideRejectsInventedAction(t *testing.T) {
 	}
 }
 
+// The exact inconsistency seen in the second harness run: escalate carrying an
+// alternate_method. A consumer reading that field without also checking action
+// would act on a suggestion the model never meant as one.
+func TestDecideRejectsAlternateMethodOnNonSuggestAction(t *testing.T) {
+	const text = `{"action":"escalate","confidence":0.88,"reasoning":"r","customer_message":"m","alternate_method":"upi"}`
+
+	c := newTestClient(t, respondWith(text))
+
+	_, raw, err := c.Decide(context.Background(), sampleInput)
+	if err == nil {
+		t.Fatal("expected an error for alternate_method on escalate, got nil")
+	}
+	if !strings.Contains(err.Error(), "must be empty") {
+		t.Errorf("error = %v, want a must-be-empty failure", err)
+	}
+	if raw != text {
+		t.Errorf("raw text was not preserved: %s", raw)
+	}
+}
+
+func TestDecideRejectsSuggestWithoutAlternateMethod(t *testing.T) {
+	const text = `{"action":"suggest_alternate_method","confidence":0.8,"reasoning":"r","customer_message":"m","alternate_method":""}`
+
+	c := newTestClient(t, respondWith(text))
+
+	if _, _, err := c.Decide(context.Background(), sampleInput); err == nil {
+		t.Fatal("expected an error for suggest_alternate_method with no method, got nil")
+	}
+}
+
+func TestDecideRejectsUnknownAlternateMethod(t *testing.T) {
+	const text = `{"action":"suggest_alternate_method","confidence":0.8,"reasoning":"r","customer_message":"m","alternate_method":"cash"}`
+
+	c := newTestClient(t, respondWith(text))
+
+	_, _, err := c.Decide(context.Background(), sampleInput)
+	if err == nil {
+		t.Fatal("expected an error for an unknown alternate_method, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid alternate_method") {
+		t.Errorf("error = %v, want an invalid-alternate-method failure", err)
+	}
+}
+
+// sampleInput has payment_method "card", so suggesting card is suggesting the
+// method that just failed.
+func TestDecideRejectsAlternateMethodMatchingPaymentMethod(t *testing.T) {
+	const text = `{"action":"suggest_alternate_method","confidence":0.8,"reasoning":"r","customer_message":"m","alternate_method":"card"}`
+
+	c := newTestClient(t, respondWith(text))
+
+	if _, _, err := c.Decide(context.Background(), sampleInput); err == nil {
+		t.Fatal("expected an error for alternate_method equal to payment_method, got nil")
+	}
+}
+
+func TestDecideAcceptsValidSuggestAlternateMethod(t *testing.T) {
+	const text = `{"action":"suggest_alternate_method","confidence":0.8,"reasoning":"r","customer_message":"m","alternate_method":"upi"}`
+
+	c := newTestClient(t, respondWith(text))
+
+	d, _, err := c.Decide(context.Background(), sampleInput)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if d.AlternateMethod != "upi" {
+		t.Errorf("AlternateMethod = %q, want upi", d.AlternateMethod)
+	}
+}
+
 func TestDecideNonOKStatusPreservesBody(t *testing.T) {
 	const body = `{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}`
 

@@ -117,7 +117,7 @@ func (c *Client) Decide(ctx context.Context, in DecisionInput) (Decision, string
 	if err := json.Unmarshal([]byte(text), &d); err != nil {
 		return Decision{}, text, fmt.Errorf("decide: unmarshal decision: %w", err)
 	}
-	if err := validate(d); err != nil {
+	if err := validate(d, in); err != nil {
 		return d, text, err
 	}
 	return d, text, nil
@@ -126,7 +126,7 @@ func (c *Client) Decide(ctx context.Context, in DecisionInput) (Decision, string
 // validate rejects a well-formed JSON object that is not a usable decision.
 // Structural validity is not the same as being in-schema, and acting on an
 // out-of-range confidence or an invented action is worse than failing loudly.
-func validate(d Decision) error {
+func validate(d Decision, in DecisionInput) error {
 	switch d.Action {
 	case ActionRetryNow, ActionRetryDelayed, ActionSuggestAlternateMethod, ActionEscalate, ActionNoRetry:
 	default:
@@ -134,6 +134,29 @@ func validate(d Decision) error {
 	}
 	if d.Confidence < 0.0 || d.Confidence > 1.0 {
 		return fmt.Errorf("decide: confidence %v out of range [0.0, 1.0]", d.Confidence)
+	}
+
+	// alternate_method is only meaningful alongside suggest_alternate_method.
+	// Set on any other action it is a dangling suggestion: a consumer reading the
+	// field without also checking the action would act on advice the model never
+	// meant to give.
+	if d.Action != ActionSuggestAlternateMethod {
+		if d.AlternateMethod != "" {
+			return fmt.Errorf("decide: alternate_method %q set on action %q, must be empty", d.AlternateMethod, d.Action)
+		}
+		return nil
+	}
+
+	switch d.AlternateMethod {
+	case "upi", "netbanking":
+	case "":
+		return errors.New("decide: action is suggest_alternate_method but no alternate_method was given")
+	default:
+		return fmt.Errorf("decide: invalid alternate_method %q", d.AlternateMethod)
+	}
+	// Suggesting the method that just failed is not an alternative.
+	if d.AlternateMethod == in.PaymentMethod {
+		return fmt.Errorf("decide: alternate_method %q is the same as payment_method", d.AlternateMethod)
 	}
 	return nil
 }
