@@ -13,12 +13,16 @@ import (
 )
 
 // stubDecider returns a fixed Decision, so a test can pin the confidence the
-// gate sees without an API key or a live call.
+// gate sees without an API key or a live call. It counts its calls, which is
+// how a test proves the stopping rule never reached the decision layer — an
+// absent log line is weak evidence, an uncalled decider is direct evidence.
 type stubDecider struct {
 	decision decide.Decision
+	calls    int
 }
 
-func (s stubDecider) Decide(context.Context, decide.DecisionInput) (decide.Decision, decide.Outcome, error) {
+func (s *stubDecider) Decide(context.Context, decide.DecisionInput) (decide.Decision, decide.Outcome, error) {
+	s.calls++
 	return s.decision, decide.Outcome{}, nil
 }
 
@@ -36,6 +40,14 @@ func webhookBody(paymentID, errorReason string) string {
 // emitted, decoded as generic maps so a test can assert on exact JSON keys.
 func fire(t *testing.T, h *Handler, body string) []map[string]any {
 	t.Helper()
+	return fireEvent(t, h, "evt_test_"+t.Name(), body)
+}
+
+// fireEvent is fire with an explicit event id, for tests that deliver the same
+// payment more than once: reusing an event id would be a redelivery and get
+// deduplicated before the attempt counter ever ran.
+func fireEvent(t *testing.T, h *Handler, eventID, body string) []map[string]any {
+	t.Helper()
 
 	var buf bytes.Buffer
 	saved := logOut
@@ -43,7 +55,7 @@ func fire(t *testing.T, h *Handler, body string) []map[string]any {
 	defer func() { logOut = saved }()
 
 	req := httptest.NewRequest(http.MethodPost, "/webhook/payment-failed", strings.NewReader(body))
-	req.Header.Set(eventIDHeader, "evt_test_"+t.Name())
+	req.Header.Set(eventIDHeader, eventID)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
@@ -79,7 +91,7 @@ func findLine(t *testing.T, lines []map[string]any, event string) map[string]any
 // TestConfidenceGateOverridesLowConfidence is the core case: the model answers
 // confidently enough to parse but not confidently enough to act on.
 func TestConfidenceGateOverridesLowConfidence(t *testing.T) {
-	h := NewHandler(stubDecider{decision: decide.Decision{
+	h := NewHandler(&stubDecider{decision: decide.Decision{
 		Action:          decide.ActionRetryNow,
 		Confidence:      0.70,
 		Reasoning:       "Funds may have cleared since the first attempt.",
@@ -116,7 +128,7 @@ func TestConfidenceGateOverridesLowConfidence(t *testing.T) {
 // a gate that fires on everything would be indistinguishable from one that
 // works, since escalate is a plausible answer for most inputs.
 func TestConfidenceGateLeavesConfidentDecisionAlone(t *testing.T) {
-	h := NewHandler(stubDecider{decision: decide.Decision{
+	h := NewHandler(&stubDecider{decision: decide.Decision{
 		Action:          decide.ActionRetryDelayed,
 		Confidence:      0.75, // exactly at the threshold: acted on, not overridden
 		Reasoning:       "First failure, one retry remains.",
@@ -141,7 +153,7 @@ func TestConfidenceGateLeavesConfidentDecisionAlone(t *testing.T) {
 // is consulted at all, so it produces no decision and no override, even though
 // both paths end in escalation.
 func TestConfidenceGateAndStoppingRuleAreDistinct(t *testing.T) {
-	h := NewHandler(stubDecider{decision: decide.Decision{
+	h := NewHandler(&stubDecider{decision: decide.Decision{
 		Action:     decide.ActionRetryNow,
 		Confidence: 0.70,
 	}}, NewInMemoryAttemptStore())
@@ -170,7 +182,7 @@ func TestConfidenceGateAndStoppingRuleAreDistinct(t *testing.T) {
 // have rejected — a live payment suggestion attached to a case that means
 // "needs human review". The value survives in the log rather than the Decision.
 func TestConfidenceGateClearsAlternateMethod(t *testing.T) {
-	h := NewHandler(stubDecider{decision: decide.Decision{
+	h := NewHandler(&stubDecider{decision: decide.Decision{
 		Action:          decide.ActionSuggestAlternateMethod,
 		Confidence:      0.68,
 		AlternateMethod: "upi",
@@ -199,5 +211,63 @@ func TestConfidenceGateClearsAlternateMethod(t *testing.T) {
 	}
 	if got := override["confidence"]; got != 0.68 {
 		t.Errorf("confidence = %v, want 0.68 untouched", got)
+	}
+}
+
+// TestStoppingRuleHoldsAcrossRepeatedDeliveries is the deterministic twin of
+// the live three-delivery run: the same payment arrives three times under
+// distinct event ids, so nothing is deduplicated and the attempt counter sees
+// every one.
+//
+// The point is that the breaker stays closed rather than tripping once and
+// resetting. It also asserts what a live log cannot: the decider is called
+// exactly once across all three, proving deliveries 2 and 3 were stopped
+// before the decision layer rather than merely producing no decision log.
+func TestStoppingRuleHoldsAcrossRepeatedDeliveries(t *testing.T) {
+	decider := &stubDecider{decision: decide.Decision{
+		Action:          decide.ActionRetryDelayed,
+		Confidence:      0.90, // high, so the confidence gate cannot be the cause
+		Reasoning:       "First failure, one retry remains.",
+		CustomerMessage: "We'll automatically retry your payment shortly.",
+	}}
+	h := NewHandler(decider, NewInMemoryAttemptStore())
+
+	// insufficient_funds budgets 1: delivery 1 is within budget, 2 and 3 are not.
+	body := webhookBody("pay_repeated", "insufficient_funds")
+
+	first := fireEvent(t, h, "evt_repeat_1", body)
+	received := findLine(t, first, "payment_received")
+	if got := received["decision_action"]; got != decide.ActionRetryDelayed {
+		t.Errorf("delivery 1 decision_action = %v, want %q", got, decide.ActionRetryDelayed)
+	}
+	for _, m := range first {
+		if m["event"] == "stopping_rule_triggered" {
+			t.Errorf("delivery 1 was stopped, but attempt 1 is within a budget of 1")
+		}
+	}
+
+	for i, eventID := range []string{"evt_repeat_2", "evt_repeat_3"} {
+		delivery := i + 2
+		lines := fireEvent(t, h, eventID, body)
+
+		stop := findLine(t, lines, "stopping_rule_triggered")
+		if got := stop["escalation_reason"]; got != EscalationReasonBudgetExhausted {
+			t.Errorf("delivery %d escalation_reason = %v, want %v", delivery, got, EscalationReasonBudgetExhausted)
+		}
+		if got, want := stop["attempt_count"], float64(delivery); got != want {
+			t.Errorf("delivery %d attempt_count = %v, want %v", delivery, got, want)
+		}
+		if got := stop["budget"]; got != float64(1) {
+			t.Errorf("delivery %d budget = %v, want 1", delivery, got)
+		}
+		for _, m := range lines {
+			if m["event"] == "payment_received" {
+				t.Errorf("delivery %d logged payment_received; a stopped payment returns before that", delivery)
+			}
+		}
+	}
+
+	if decider.calls != 1 {
+		t.Errorf("decider was called %d times across 3 deliveries, want 1 — deliveries 2 and 3 must not reach the decision layer", decider.calls)
 	}
 }
