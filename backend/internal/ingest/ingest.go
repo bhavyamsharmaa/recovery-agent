@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"sync"
@@ -31,6 +32,23 @@ var retryBudgets = map[classify.Category]int{
 	classify.CategorySoftDecline:       2,
 	classify.CategoryNetworkError:      3,
 }
+
+// Escalation reasons say WHY something was escalated, so a consumer reading a
+// queue of escalations can group them by cause rather than re-deriving it.
+// Expected to grow into a larger set as more escalation paths appear.
+const (
+	EscalationReasonBudgetExhausted = "retry_budget_exhausted"
+	EscalationReasonLowConfidence   = "low_confidence"
+)
+
+// confidenceThreshold is the floor for acting on the model's own decision.
+// Below it the action is overridden to escalate: a decision the model is not
+// confident in is one a human should look at, whatever it recommends.
+//
+// 0.75 rather than something lower because the Day 2 harness never observed a
+// confidence below 0.68 across 20 scenarios — a threshold under that would
+// have been a gate that never closes.
+const confidenceThreshold = 0.75
 
 // Decider is the decision layer as this package needs it. An interface rather
 // than a concrete client so the handler can be tested without an API key.
@@ -129,6 +147,21 @@ type duplicateLog struct {
 	TS        string `json:"ts"`
 }
 
+// confidenceOverrideLog records a decision the model made and the gate
+// replaced. It is emitted alongside the payment_received line rather than
+// instead of it: received carries the action actually used, this carries the
+// fact that the model wanted something else.
+type confidenceOverrideLog struct {
+	Event            string            `json:"event"`
+	PaymentID        string            `json:"payment_id"`
+	Category         classify.Category `json:"category"`
+	OriginalAction   string            `json:"original_action"`
+	OverriddenAction string            `json:"overridden_action"`
+	Confidence       float64           `json:"confidence"`
+	EscalationReason string            `json:"escalation_reason"`
+	TS               string            `json:"ts"`
+}
+
 // stoppingRuleLog records a payment stopped before the decision layer was
 // consulted. It carries no decision fields because no decision was made.
 type stoppingRuleLog struct {
@@ -211,7 +244,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Category:         category,
 			AttemptCount:     attemptCount,
 			Budget:           budget,
-			EscalationReason: "retry_budget_exhausted",
+			EscalationReason: EscalationReasonBudgetExhausted,
 			TS:               now(),
 		})
 		ok(w)
@@ -232,6 +265,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// from. Asking the model anyway would be inviting a guess.
 	var decideErr error
 	var decideRetried bool
+	var override *confidenceOverrideLog
 	if category != classify.CategoryUnknown {
 		ctx, cancel := context.WithTimeout(r.Context(), decideTimeout)
 		d, outcome, err := h.decider.Decide(ctx, decide.DecisionInput{
@@ -257,14 +291,39 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			decideErr = err
 		} else {
-			confidence := d.Confidence
-			received.DecisionAction = d.Action
+			// The confidence gate is deliberately separate from the stopping rule
+			// above. Both can end in escalate, but they answer different questions:
+			// the stopping rule asks whether any automated action is left to take,
+			// this asks whether the model's answer is trustworthy enough to act on.
+			// Collapsing them would lose that distinction in the logs, which is
+			// exactly what escalation_reason exists to preserve.
+			gated, overridden := applyConfidenceGate(d)
+			if overridden {
+				override = &confidenceOverrideLog{
+					Event:            "confidence_override",
+					PaymentID:        p.ID,
+					Category:         category,
+					OriginalAction:   d.Action,
+					OverriddenAction: gated.Action,
+					Confidence:       d.Confidence,
+					EscalationReason: EscalationReasonLowConfidence,
+					TS:               now(),
+				}
+			}
+
+			// received reports the action actually used, which is the post-gate one.
+			confidence := gated.Confidence
+			received.DecisionAction = gated.Action
 			received.DecisionConfidence = &confidence
-			received.DecisionAlternateMethod = d.AlternateMethod
+			received.DecisionAlternateMethod = gated.AlternateMethod
 		}
 	}
 
 	logLine(received)
+
+	if override != nil {
+		logLine(*override)
+	}
 
 	// Logged whether or not the second attempt succeeded — a rising retry rate is
 	// worth seeing even while the outcomes stay good.
@@ -293,6 +352,30 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ok(w)
 }
 
+// applyConfidenceGate overrides a low-confidence decision to escalate and
+// reports whether it did. The returned Decision is the one to use downstream.
+//
+// Confidence itself is left untouched: it records how sure the model was about
+// the answer it gave, and overwriting it would destroy the very signal that
+// triggered the override.
+//
+// reasoning and customer_message are also left as written. A customer_message
+// that reads oddly next to an escalate action is a known gap.
+func applyConfidenceGate(d decide.Decision) (decide.Decision, bool) {
+	if d.Confidence >= confidenceThreshold {
+		return d, false
+	}
+	d.Action = decide.ActionEscalate
+
+	// alternate_method only means anything alongside suggest_alternate_method.
+	// Carrying it onto an escalate would leave the dangling suggestion that
+	// decide.validate() rejects everywhere else: a consumer reading the field
+	// without checking the action would act on advice no longer being given.
+	d.AlternateMethod = ""
+
+	return d, true
+}
+
 // ok answers 200 for new events and duplicates alike. Razorpay retries any
 // non-2xx, so returning an error for a duplicate would produce more duplicates.
 func ok(w http.ResponseWriter) {
@@ -301,13 +384,17 @@ func ok(w http.ResponseWriter) {
 	fmt.Fprintln(w, `{"status":"ok"}`)
 }
 
+// logOut is where log lines go. A package var rather than os.Stdout inline so
+// tests can capture what the handler emitted; production never reassigns it.
+var logOut io.Writer = os.Stdout
+
 func logLine(v any) {
 	b, err := json.Marshal(v)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "could not marshal log line: %v\n", err)
 		return
 	}
-	fmt.Println(string(b))
+	fmt.Fprintln(logOut, string(b))
 }
 
 func now() string { return time.Now().UTC().Format(time.RFC3339) }
