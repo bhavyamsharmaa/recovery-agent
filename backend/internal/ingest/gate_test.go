@@ -271,3 +271,103 @@ func TestStoppingRuleHoldsAcrossRepeatedDeliveries(t *testing.T) {
 		t.Errorf("decider was called %d times across 3 deliveries, want 1 — deliveries 2 and 3 must not reach the decision layer", decider.calls)
 	}
 }
+
+// TestStoppingRuleIncludesCustomerMessage covers the text a stopped payment
+// produces. The stopping rule returns before the model is consulted, so without
+// this the customer is told nothing at all — which for hard_decline is every
+// payment, since a budget of 0 trips the rule on the first delivery.
+func TestStoppingRuleIncludesCustomerMessage(t *testing.T) {
+	cases := []struct {
+		name        string
+		errorReason string
+		category    string
+		want        string
+	}{
+		{
+			name:        "hard_decline",
+			errorReason: "card_declined",
+			category:    "hard_decline",
+			want:        "Your payment couldn't be completed. Please try a different card or contact your bank.",
+		},
+		{
+			// unknown never reaches the decision layer either, and budgets 0 by
+			// being absent from the table, so it stops on the first delivery too.
+			name:        "unknown falls back",
+			errorReason: "something_we_have_no_rule_for",
+			category:    "unknown",
+			want:        escalationMessageFallback,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			decider := &stubDecider{decision: decide.Decision{
+				Action: decide.ActionEscalate, Confidence: 0.90,
+			}}
+			h := NewHandler(decider, NewInMemoryAttemptStore())
+
+			lines := fire(t, h, webhookBody("pay_"+tc.name, tc.errorReason))
+
+			stop := findLine(t, lines, "stopping_rule_triggered")
+			if got := stop["category"]; got != tc.category {
+				t.Errorf("category = %v, want %v", got, tc.category)
+			}
+			if got := stop["escalation_customer_message"]; got != tc.want {
+				t.Errorf("escalation_customer_message = %q, want %q", got, tc.want)
+			}
+			// The message is static text, not a decision: nothing here was
+			// inferred, so no confidence or action field belongs on the line.
+			for _, field := range []string{"confidence", "action", "decision_action"} {
+				if _, present := stop[field]; present {
+					t.Errorf("stopping_rule_triggered carries %q; the message is static, not a decision", field)
+				}
+			}
+			if decider.calls != 0 {
+				t.Errorf("decider called %d times; the stopping rule must never consult the model", decider.calls)
+			}
+		})
+	}
+}
+
+// TestEscalationMessagesCoverEveryBudgetedCategory guards the map against the
+// taxonomy growing past it: a category with a retry budget can have that budget
+// exhausted, and must have something to say when it does.
+func TestEscalationMessagesCoverEveryBudgetedCategory(t *testing.T) {
+	for category := range retryBudgets {
+		if _, ok := escalationMessages[category]; !ok {
+			t.Errorf("category %q has a retry budget but no escalation message", category)
+		}
+	}
+}
+
+// TestEscalationMessagesRespectMessageConstraints holds the static text to the
+// same rules the model's own customer_message follows — see
+// decide.messageConstraints. A hand-written string bypasses the prompt, so
+// nothing but this test stops it from promising a timeframe or an outcome.
+func TestEscalationMessagesRespectMessageConstraints(t *testing.T) {
+	all := map[string]string{"fallback": escalationMessageFallback}
+	for c, m := range escalationMessages {
+		all[string(c)] = m
+	}
+
+	// Rule 2: never imply certainty of success.
+	forbidden := []string{"will go through", "will work", "will succeed", "guarantee"}
+	// Rule 1: never state a specific timeframe. "later" and "shortly" are fine;
+	// any digit in this text would be a time window or an amount, neither of
+	// which belongs in a static message.
+	for name, msg := range all {
+		lower := strings.ToLower(msg)
+		for _, f := range forbidden {
+			if strings.Contains(lower, f) {
+				t.Errorf("%s message implies success: %q contains %q", name, msg, f)
+			}
+		}
+		if strings.ContainsAny(msg, "0123456789") {
+			t.Errorf("%s message contains a digit, which would be a timeframe or amount: %q", name, msg)
+		}
+		// Rule 3: escalations must give one concrete next action.
+		if !strings.Contains(lower, "please") {
+			t.Errorf("%s message gives no next action: %q", name, msg)
+		}
+	}
+}

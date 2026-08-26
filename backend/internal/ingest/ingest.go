@@ -50,6 +50,32 @@ const (
 // have been a gate that never closes.
 const confidenceThreshold = 0.75
 
+// escalationMessages are what the customer is told when the stopping rule
+// fires. Static by necessity: the stopping rule exists to avoid the model call,
+// so generating these would defeat it. They are held to the same constraints as
+// the model's own customer_message (see decide.messageConstraints) — no
+// timeframe, no promised outcome, always one concrete next action.
+var escalationMessages = map[classify.Category]string{
+	classify.CategoryHardDecline:       "Your payment couldn't be completed. Please try a different card or contact your bank.",
+	classify.CategoryInsufficientFunds: "We were unable to process your payment after multiple attempts. Please try a different payment method.",
+	classify.CategoryBankDowntime:      "We were unable to complete your payment after multiple attempts. Please try again later or use a different payment method.",
+	classify.CategorySoftDecline:       "We were unable to process your payment after multiple attempts. Please check your payment details and try again, or use a different method.",
+	classify.CategoryNetworkError:      "We were unable to complete your payment due to a technical issue. Please try again or use a different payment method.",
+}
+
+// escalationMessageFallback covers unknown and any category added to the
+// taxonomy without a message being written for it. Saying less is correct here:
+// with no idea why the payment failed, naming a cause would be a guess.
+const escalationMessageFallback = "We were unable to complete your payment. Please contact support or try a different payment method."
+
+// escalationMessage returns the customer-facing text for a stopped payment.
+func escalationMessage(c classify.Category) string {
+	if m, ok := escalationMessages[c]; ok {
+		return m
+	}
+	return escalationMessageFallback
+}
+
 // Decider is the decision layer as this package needs it. An interface rather
 // than a concrete client so the handler can be tested without an API key.
 type Decider interface {
@@ -177,7 +203,15 @@ type stoppingRuleLog struct {
 	AttemptCount     int               `json:"attempt_count"`
 	Budget           int               `json:"budget"`
 	EscalationReason string            `json:"escalation_reason"`
-	TS               string            `json:"ts"`
+
+	// EscalationCustomerMessage is the static text above, carried on the line so
+	// the audit trail shows what the customer was told — the same visibility a
+	// normal decision's customer_message gets. No action or confidence field
+	// accompanies it: the action is implicitly escalate, and nothing here was
+	// inferred, so there is no confidence to report.
+	EscalationCustomerMessage string `json:"escalation_customer_message"`
+
+	TS string `json:"ts"`
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -251,7 +285,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			AttemptCount:     attemptCount,
 			Budget:           budget,
 			EscalationReason: EscalationReasonBudgetExhausted,
-			TS:               now(),
+
+			EscalationCustomerMessage: escalationMessage(category),
+
+			TS: now(),
 		})
 		ok(w)
 		return
