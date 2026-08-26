@@ -162,3 +162,42 @@ func TestConfidenceGateAndStoppingRuleAreDistinct(t *testing.T) {
 		}
 	}
 }
+
+// TestConfidenceGateClearsAlternateMethod covers the one field the gate does
+// not carry over. suggest_alternate_method is the only action for which
+// alternate_method is meaningful, so overriding the action to escalate while
+// leaving "upi" in place would produce a Decision that decide.validate() would
+// have rejected — a live payment suggestion attached to a case that means
+// "needs human review". The value survives in the log rather than the Decision.
+func TestConfidenceGateClearsAlternateMethod(t *testing.T) {
+	h := NewHandler(stubDecider{decision: decide.Decision{
+		Action:          decide.ActionSuggestAlternateMethod,
+		Confidence:      0.68,
+		AlternateMethod: "upi",
+		Reasoning:       "Card has exhausted its retries; another method may work.",
+		CustomerMessage: "Please try paying with UPI instead.",
+	}}, NewInMemoryAttemptStore())
+
+	lines := fire(t, h, webhookBody("pay_altcleared", "insufficient_funds"))
+
+	received := findLine(t, lines, "payment_received")
+	if got := received["decision_action"]; got != decide.ActionEscalate {
+		t.Errorf("decision_action = %v, want %q", got, decide.ActionEscalate)
+	}
+	// omitempty means a cleared value is absent from the line entirely; either
+	// absent or explicitly empty is correct, "upi" is not.
+	if got, ok := received["decision_alternate_method"]; ok && got != "" {
+		t.Errorf("decision_alternate_method = %v, want cleared", got)
+	}
+
+	override := findLine(t, lines, "confidence_override")
+	if got := override["original_action"]; got != decide.ActionSuggestAlternateMethod {
+		t.Errorf("original_action = %v, want %q", got, decide.ActionSuggestAlternateMethod)
+	}
+	if got := override["original_alternate_method"]; got != "upi" {
+		t.Errorf("original_alternate_method = %v, want \"upi\" — the cleared value must stay auditable", got)
+	}
+	if got := override["confidence"]; got != 0.68 {
+		t.Errorf("confidence = %v, want 0.68 untouched", got)
+	}
+}

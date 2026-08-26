@@ -159,7 +159,13 @@ type confidenceOverrideLog struct {
 	OverriddenAction string            `json:"overridden_action"`
 	Confidence       float64           `json:"confidence"`
 	EscalationReason string            `json:"escalation_reason"`
-	TS               string            `json:"ts"`
+
+	// OriginalAlternateMethod is what the gate cleared, kept so a reviewer can
+	// see what was overridden away rather than only that something was. Omitted
+	// when the overridden action never carried one, which is most of the time.
+	OriginalAlternateMethod string `json:"original_alternate_method,omitempty"`
+
+	TS string `json:"ts"`
 }
 
 // stoppingRuleLog records a payment stopped before the decision layer was
@@ -307,7 +313,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					OverriddenAction: gated.Action,
 					Confidence:       d.Confidence,
 					EscalationReason: EscalationReasonLowConfidence,
-					TS:               now(),
+
+					// Read from d, not gated: gated is the post-clear copy.
+					OriginalAlternateMethod: d.AlternateMethod,
+
+					TS: now(),
 				}
 			}
 
