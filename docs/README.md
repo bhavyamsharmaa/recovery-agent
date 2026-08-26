@@ -17,6 +17,16 @@ An agent that classifies failed payments and recovers them with policy-driven re
   same payment read the same count and both pass a budget with one attempt left.
   `Get` stays on the interface for tests and for Day 5's queries.
 
+- **LLM decision layer, double-failure gap (found and fixed):** the bounded
+  retry added to survive occasional Haiku output-formatting failures had no
+  defined behavior if both the original call and the retry failed — a payment
+  would receive no decision and no customer message. Found during a routine
+  audit, not a failing test. Fixed with a conservative static fallback
+  (action: `no_retry`, generic customer message, logged with
+  `source: fallback_rule`) so no payment is ever left silently unresolved. See
+  [issue #1](https://github.com/bhavyamsharmaa/recovery-agent/issues/1) for the
+  full discovery-to-fix trail.
+
 - **Webhook deduplication is likewise in-memory.** After a restart, a redelivery
   of an event seen before the restart is processed as new.
 
