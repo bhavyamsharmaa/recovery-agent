@@ -56,6 +56,43 @@ const (
 // line at once, so it is not a dial to nudge.
 const confidenceThreshold = 0.75
 
+// Decision sources say WHO decided, so no line in the log leaves that to be
+// inferred from which fields happen to be present. Every resolved payment
+// carries exactly one of these.
+const (
+	DecisionSourceLLM          = "llm"
+	DecisionSourceStoppingRule = "stopping_rule"
+	DecisionSourceFallbackRule = "fallback_rule"
+)
+
+// fallbackDecision is applied when the decision layer fails on both its
+// original attempt and its retry. It is static by necessity: the failure being
+// handled is the model being unusable, so asking it again is the one thing that
+// cannot work.
+//
+// no_retry rather than escalate or a retry, because nothing is known about this
+// payment beyond that the system could not reason about it. Retrying acts on a
+// judgement never made; escalating claims a policy reason that was never
+// reached. no_retry stops and says so.
+//
+// The message is deliberately generic, unlike the category-specific stopping
+// rule messages: this is a system-level outage, not a policy decision about
+// this category of failure, and telling the customer something specific would
+// imply an understanding of their payment that was never obtained.
+//
+// Confidence is 0 and is not a model score. It is not passed through the
+// confidence gate — the gate exists to second-guess the model, and there is no
+// model output here to second-guess.
+func fallbackDecision() decide.Decision {
+	return decide.Decision{
+		Action:          decide.ActionNoRetry,
+		Confidence:      0,
+		Reasoning:       "LLM decision layer failed after retry; falling back to conservative no-retry policy pending manual review.",
+		CustomerMessage: "We were unable to complete your payment. Please try a different payment method or contact support.",
+		AlternateMethod: "",
+	}
+}
+
 // escalationMessages are what the customer is told when the stopping rule
 // fires. Static by necessity: the stopping rule exists to avoid the model call,
 // so generating these would defeat it. They are held to the same constraints as
@@ -151,7 +188,25 @@ type receivedLog struct {
 	DecisionConfidence      *float64 `json:"decision_confidence,omitempty"`
 	DecisionAlternateMethod string   `json:"decision_alternate_method,omitempty"`
 
+	// DecisionSource distinguishes a decision the model made from one the
+	// fallback rule supplied. Both carry an action and a confidence, and without
+	// this they would be indistinguishable in the log.
+	DecisionSource string `json:"decision_source,omitempty"`
+
 	TS string `json:"ts"`
+}
+
+// fallbackDecisionLog records the resolution of a payment the decision layer
+// could not answer for. It follows the decision_failed line rather than
+// replacing it: that one carries the raw error, this one carries what was done
+// about it.
+type fallbackDecisionLog struct {
+	Event         string            `json:"event"`
+	PaymentID     string            `json:"payment_id"`
+	Category      classify.Category `json:"category"`
+	Source        string            `json:"source"`
+	OriginalError string            `json:"original_error"`
+	TS            string            `json:"ts"`
 }
 
 type decisionFailedLog struct {
@@ -209,6 +264,11 @@ type stoppingRuleLog struct {
 	AttemptCount     int               `json:"attempt_count"`
 	Budget           int               `json:"budget"`
 	EscalationReason string            `json:"escalation_reason"`
+
+	// Source is always DecisionSourceStoppingRule. Carried anyway so that one
+	// field answers "who decided this" across every line, rather than the
+	// answer being encoded in which event name was used.
+	Source string `json:"source"`
 
 	// EscalationCustomerMessage is the static text above, carried on the line so
 	// the audit trail shows what the customer was told — the same visibility a
@@ -296,6 +356,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			AttemptCount:     attemptCount,
 			Budget:           budget,
 			EscalationReason: EscalationReasonBudgetExhausted,
+			Source:           DecisionSourceStoppingRule,
 
 			EscalationCustomerMessage: escalationMessage(category),
 
@@ -374,6 +435,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			received.DecisionAction = gated.Action
 			received.DecisionConfidence = &confidence
 			received.DecisionAlternateMethod = gated.AlternateMethod
+			received.DecisionSource = DecisionSourceLLM
+		}
+
+		// Both the original call and its retry failed to produce a usable
+		// Decision. Leaving the payment here would mean no action and no message
+		// for a customer whose payment failed — the model being unavailable is
+		// not a reason to tell them nothing. See issue #1.
+		if decideErr != nil {
+			fb := fallbackDecision()
+			confidence := fb.Confidence
+			received.DecisionAction = fb.Action
+			received.DecisionConfidence = &confidence
+			received.DecisionAlternateMethod = fb.AlternateMethod
+			received.DecisionSource = DecisionSourceFallbackRule
 		}
 	}
 
@@ -394,9 +469,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// A failed decision is logged and dropped. Razorpay retries any non-2xx, so
-	// failing the webhook because the model was unavailable would just produce
+	// A failed decision does not fail the webhook. Razorpay retries any non-2xx,
+	// so returning an error because the model was unavailable would just produce
 	// redeliveries of a payment we already recorded.
+	//
+	// Two lines, not one: decision_failed captures the raw error, and
+	// fallback_decision_applied records the resolution. Keeping them separate
+	// means a rising failure rate stays visible even while every payment is
+	// still being resolved.
 	if decideErr != nil {
 		logLine(decisionFailedLog{
 			Event:     "decision_failed",
@@ -404,6 +484,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Category:  category,
 			Error:     decideErr.Error(),
 			TS:        now(),
+		})
+		logLine(fallbackDecisionLog{
+			Event:         "fallback_decision_applied",
+			PaymentID:     p.ID,
+			Category:      category,
+			Source:        DecisionSourceFallbackRule,
+			OriginalError: decideErr.Error(),
+			TS:            now(),
 		})
 	}
 
