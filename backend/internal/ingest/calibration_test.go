@@ -15,15 +15,17 @@ import (
 // where retrying may be premature and escalating may be unnecessary, and the
 // model's own confidence says so.
 //
-// The confidences are recorded observations, not guesses, and they are not
-// stable: the same input re-measured returns 0.68 most of the time and 0.78 or
-// exactly 0.75 otherwise. observedBelow records how often each scenario landed
-// under the threshold across repeated live calls, which is the honest form of
-// this claim — the gate fires on these inputs usually, not always.
+// The confidences are recorded observations, not guesses. Before the decision
+// call pinned temperature to 0 they were not stable — the same input returned
+// 0.68 most of the time and 0.75 or 0.78 otherwise, which for a threshold of
+// 0.75 meant a scenario could flip between escalating and not with nothing
+// changing. With temperature pinned, five repeats of each of these returned an
+// identical score.
 //
-// This matters more than it looks. The scores are quantised to a handful of
-// values (0.68, 0.75, 0.78, 0.82, 0.85) and 0.75 sits exactly on the boundary,
-// so a scenario can flip between escalating and not without anything changing.
+// observedBelow still records a ratio rather than asserting determinism.
+// Temperature 0 reduces variance; it does not contractually eliminate it, and
+// the scores remain quantised to a handful of values (0.68, 0.75, 0.78, 0.82,
+// 0.85) with 0.75 sitting exactly on the boundary.
 var ambiguousScenarios = []struct {
 	name string
 	in   decide.DecisionInput
@@ -44,7 +46,7 @@ var ambiguousScenarios = []struct {
 		},
 		observedConfidence: 0.68,
 		observedAction:     decide.ActionRetryDelayed,
-		observedBelow:      6, observedRuns: 6,
+		observedBelow:      5, observedRuns: 5,
 	},
 	{
 		name: "insufficient funds, large amount stale 3 hours",
@@ -55,7 +57,7 @@ var ambiguousScenarios = []struct {
 		},
 		observedConfidence: 0.68,
 		observedAction:     decide.ActionRetryDelayed,
-		observedBelow:      4, observedRuns: 6,
+		observedBelow:      5, observedRuns: 5,
 	},
 }
 
@@ -91,8 +93,9 @@ func TestAmbiguousScenariosEscalate(t *testing.T) {
 
 // TestAmbiguousScenariosStillScoreBelowThreshold re-measures against the real
 // API and fails if a scenario has drifted above the threshold in the majority of
-// runs. It asks for a majority rather than every run because the scores are not
-// deterministic — a single call is not evidence either way.
+// runs. It asks for a majority rather than every run because temperature 0
+// reduces variance without guaranteeing its absence, so one call above the line
+// is not on its own proof the calibration has gone.
 //
 // Skipped unless RECOVERY_LIVE_TESTS=1: it costs money and needs the network.
 // It is the only thing that can tell you the calibration has gone stale after a

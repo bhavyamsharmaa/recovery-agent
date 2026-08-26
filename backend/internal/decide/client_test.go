@@ -1,6 +1,7 @@
 package decide
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -379,9 +380,12 @@ func TestDecideSendsCorrectRequest(t *testing.T) {
 	var got apiRequest
 	var headers http.Header
 
+	var rawBody []byte
+
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		headers = r.Header.Clone()
-		json.NewDecoder(r.Body).Decode(&got)
+		rawBody, _ = io.ReadAll(r.Body)
+		json.Unmarshal(rawBody, &got)
 		respondWith(`{"action":"no_retry","confidence":0.5,"reasoning":"r","customer_message":"m"}`)(w, r)
 	})
 
@@ -397,6 +401,18 @@ func TestDecideSendsCorrectRequest(t *testing.T) {
 	}
 	if got.System != BuildSystemPrompt() {
 		t.Error("system prompt sent does not match BuildSystemPrompt()")
+	}
+	// Decoding into apiRequest cannot distinguish an omitted temperature from a
+	// zero one, so the raw body is checked for the field itself. A pointer that
+	// stopped being a pointer would silently drop it and nothing else would
+	// notice.
+	if got.Temperature == nil {
+		t.Error("temperature was not sent")
+	} else if *got.Temperature != 0 {
+		t.Errorf("temperature = %v, want 0", *got.Temperature)
+	}
+	if !bytes.Contains(rawBody, []byte(`"temperature":0`)) {
+		t.Errorf("request body does not carry temperature 0: %s", rawBody)
 	}
 	if len(got.Messages) != 1 || got.Messages[0].Role != "user" {
 		t.Fatalf("messages = %+v, want one user message", got.Messages)

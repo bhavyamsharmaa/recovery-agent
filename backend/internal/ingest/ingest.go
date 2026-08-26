@@ -271,14 +271,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	category := classify.Classify(p.ErrorReason, p.ErrorSource)
 
 	// Attempts are counted per payment id — how many times THIS payment has been
-	// seen — not per category.
+	// seen — not per category. Counting happens before the budget check so that
+	// a stopped payment still records the attempt that tripped the rule.
 	//
-	// The count is READ first and only written once the payment is going to be
-	// acted on, so a stopped payment does not consume an attempt it never got.
-	// Note that this read and the write below are not one atomic step: two
-	// concurrent deliveries of the same payment can both read the same count and
-	// both proceed. See the note in docs/README.md.
-	priorAttempts := h.attempts.Get(p.ID)
+	// Increment is one atomic step and the check reads its return value, so two
+	// concurrent deliveries of the same payment cannot both pass a budget with
+	// one attempt left. A Get-then-Increment pair would read the same count in
+	// both and let both through, which is why Get stays out of this path.
+	attemptCount := h.attempts.Increment(p.ID)
 
 	// A category absent from the table budgets 0, which is the safe direction:
 	// hard_decline and unknown both land here and both must stop.
@@ -288,15 +288,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// budget is spent there is no automated action left to take on this payment,
 	// so asking the model would spend a call on a question whose answer cannot
 	// be used.
-	//
-	// >= rather than >: priorAttempts counts attempts already made, so having
-	// made as many as the budget allows means there are none left.
-	if priorAttempts >= budget {
+	if attemptCount > budget {
 		logLine(stoppingRuleLog{
 			Event:            "stopping_rule_triggered",
 			PaymentID:        p.ID,
 			Category:         category,
-			AttemptCount:     priorAttempts,
+			AttemptCount:     attemptCount,
 			Budget:           budget,
 			EscalationReason: EscalationReasonBudgetExhausted,
 
@@ -307,10 +304,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ok(w)
 		return
 	}
-
-	// Past the budget check, so this payment is being acted on: record the
-	// attempt. attemptCount is this attempt's own number, 1 for the first.
-	attemptCount := h.attempts.Increment(p.ID)
 
 	received := receivedLog{
 		Event:       "payment_received",

@@ -11,14 +11,11 @@ An agent that classifies failed payments and recovers them with policy-driven re
   restart before then silently zeroes every counter, so a payment that had
   exhausted its budget becomes eligible again.
 
-- **The budget check reads and writes the counter in two steps.** The stopping
-  rule calls `Get` to read the count and `Increment` only once the payment is
-  going to be acted on, so a stopped delivery does not consume an attempt it
-  never got. The two calls are individually atomic but not atomic together: two
-  concurrent deliveries of the same payment can both read the same count and
-  both proceed, allowing one more attempt than the budget permits. Concurrent
-  redeliveries of the *same event* are still caught by deduplication; this
-  affects genuine simultaneous failures of one payment only.
+  `AttemptStore.Get` is deliberately unused in the request path. The stopping
+  rule calls `Increment` and checks its return value, because that is one atomic
+  step: a `Get`-then-`Increment` pair would let two concurrent deliveries of the
+  same payment read the same count and both pass a budget with one attempt left.
+  `Get` stays on the interface for tests and for Day 5's queries.
 
 - **Webhook deduplication is likewise in-memory.** After a restart, a redelivery
   of an event seen before the restart is processed as new.
@@ -31,11 +28,26 @@ An agent that classifies failed payments and recovers them with policy-driven re
   `RECOVERY_LIVE_TESTS=1`.
 
   Observed scores are quantised to a handful of values (0.68, 0.75, 0.78, 0.82,
-  0.85) rather than continuous, and are not stable run to run: the same input
-  can return 0.68 once and 0.78 the next time. 0.75 sits exactly on the
-  boundary, and the comparison is `>=`, so an exact 0.75 is acted on rather than
-  escalated. Moving the threshold would move a whole cluster across the line at
-  once.
+  0.85) rather than continuous. 0.75 sits exactly on the boundary, and the
+  comparison is `>=`, so an exact 0.75 is acted on rather than escalated. Moving
+  the threshold would move a whole cluster across the line at once.
+
+- **The confidence gate concentrates on `insufficient_funds`, by design.** Across
+  every category probed, no other one has been observed producing a
+  sub-threshold confidence: `soft_decline`, `bank_downtime` and `network_error`
+  cluster at 0.78–0.85 however ambiguous the input is made. Those categories
+  have clear-cut signal — a bank outage or a mistyped CVV has an obvious right
+  response — while `insufficient_funds` genuinely trades off a retry that may be
+  premature against an escalation that may be unnecessary. The gate is not
+  broken for the other categories; there is simply nothing for it to catch.
+
+- **Decision calls pin `temperature` to 0** for reproducibility: the same failed
+  payment should get the same decision twice. This measurably tightened
+  variance — three inputs that previously returned two or three different
+  confidences across five identical calls each returned a single value
+  afterwards. It is a reduction, not a guarantee: residual variance may remain,
+  which is why the live calibration test asks for a majority of runs below the
+  threshold rather than all of them.
 
 ## Known test-fidelity limitations
 

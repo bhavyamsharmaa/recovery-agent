@@ -18,6 +18,12 @@ const (
 	maxTokens        = 1024
 )
 
+// temperature is 0 for reproducibility: the same failed payment should get the
+// same decision twice. It reduces variance rather than eliminating it — the
+// confidence scores observed for borderline inputs still move between adjacent
+// quantised values across identical calls.
+var temperature = 0.0
+
 type Client struct {
 	apiKey string
 	http   *http.Client
@@ -45,6 +51,11 @@ type apiRequest struct {
 	MaxTokens int          `json:"max_tokens"`
 	System    string       `json:"system"`
 	Messages  []apiMessage `json:"messages"`
+
+	// Temperature is a pointer so that 0 is sent rather than dropped. A plain
+	// float64 with omitempty would silently omit the one value we want, and
+	// without omitempty a zero value would be indistinguishable from unset.
+	Temperature *float64 `json:"temperature,omitempty"`
 }
 
 type apiMessage struct {
@@ -100,10 +111,11 @@ func (c *Client) Decide(ctx context.Context, in DecisionInput) (Decision, Outcom
 // format failure via errFormat.
 func (c *Client) attempt(ctx context.Context, in DecisionInput) (Decision, string, error) {
 	body, err := json.Marshal(apiRequest{
-		Model:     model,
-		MaxTokens: maxTokens,
-		System:    BuildSystemPrompt(),
-		Messages:  []apiMessage{{Role: "user", Content: BuildUserMessage(in)}},
+		Model:       model,
+		MaxTokens:   maxTokens,
+		System:      BuildSystemPrompt(),
+		Messages:    []apiMessage{{Role: "user", Content: BuildUserMessage(in)}},
+		Temperature: &temperature,
 	})
 	if err != nil {
 		return Decision{}, "", fmt.Errorf("decide: marshal request: %w", err)
