@@ -254,8 +254,14 @@ func TestStoppingRuleHoldsAcrossRepeatedDeliveries(t *testing.T) {
 		if got := stop["escalation_reason"]; got != EscalationReasonBudgetExhausted {
 			t.Errorf("delivery %d escalation_reason = %v, want %v", delivery, got, EscalationReasonBudgetExhausted)
 		}
-		if got, want := stop["attempt_count"], float64(delivery); got != want {
-			t.Errorf("delivery %d attempt_count = %v, want %v", delivery, got, want)
+		// attempt_count on a stopped payment is the number of attempts ALREADY
+		// MADE, not the number of times the payment has been delivered. It is
+		// pinned at the budget once exhausted, because a stopped delivery does
+		// not consume an attempt. Deliveries 2 and 3 are therefore identical on
+		// this field — how many times a stopped payment keeps arriving is not
+		// visible in the log.
+		if got, want := stop["attempt_count"], float64(1); got != want {
+			t.Errorf("delivery %d attempt_count = %v, want %v (attempts made, not deliveries)", delivery, got, want)
 		}
 		if got := stop["budget"]; got != float64(1) {
 			t.Errorf("delivery %d budget = %v, want 1", delivery, got)

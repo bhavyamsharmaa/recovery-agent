@@ -45,9 +45,15 @@ const (
 // Below it the action is overridden to escalate: a decision the model is not
 // confident in is one a human should look at, whatever it recommends.
 //
-// 0.75 rather than something lower because the Day 2 harness never observed a
-// confidence below 0.68 across 20 scenarios — a threshold under that would
-// have been a gate that never closes.
+// Set at 0.75 based on observed score distribution (0.68-0.95) across Day 2
+// test scenarios — calibrated so the escalation path is genuinely exercised,
+// not theoretical.
+//
+// The observed scores are heavily quantised — 0.68, 0.75, 0.78, 0.82, 0.85 —
+// rather than continuous, and 0.75 has been seen exactly on the boundary. The
+// comparison below is >=, so an exact 0.75 is acted on rather than escalated.
+// Moving this constant even slightly would move a whole cluster across the
+// line at once, so it is not a dial to nudge.
 const confidenceThreshold = 0.75
 
 // escalationMessages are what the customer is told when the stopping rule
@@ -265,9 +271,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	category := classify.Classify(p.ErrorReason, p.ErrorSource)
 
 	// Attempts are counted per payment id — how many times THIS payment has been
-	// seen — not per category. Counting happens before the budget check so that
-	// a stopped payment still records the attempt that tripped the rule.
-	attemptCount := h.attempts.Increment(p.ID)
+	// seen — not per category.
+	//
+	// The count is READ first and only written once the payment is going to be
+	// acted on, so a stopped payment does not consume an attempt it never got.
+	// Note that this read and the write below are not one atomic step: two
+	// concurrent deliveries of the same payment can both read the same count and
+	// both proceed. See the note in docs/README.md.
+	priorAttempts := h.attempts.Get(p.ID)
 
 	// A category absent from the table budgets 0, which is the safe direction:
 	// hard_decline and unknown both land here and both must stop.
@@ -277,12 +288,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// budget is spent there is no automated action left to take on this payment,
 	// so asking the model would spend a call on a question whose answer cannot
 	// be used.
-	if attemptCount > budget {
+	//
+	// >= rather than >: priorAttempts counts attempts already made, so having
+	// made as many as the budget allows means there are none left.
+	if priorAttempts >= budget {
 		logLine(stoppingRuleLog{
 			Event:            "stopping_rule_triggered",
 			PaymentID:        p.ID,
 			Category:         category,
-			AttemptCount:     attemptCount,
+			AttemptCount:     priorAttempts,
 			Budget:           budget,
 			EscalationReason: EscalationReasonBudgetExhausted,
 
@@ -293,6 +307,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ok(w)
 		return
 	}
+
+	// Past the budget check, so this payment is being acted on: record the
+	// attempt. attemptCount is this attempt's own number, 1 for the first.
+	attemptCount := h.attempts.Increment(p.ID)
 
 	received := receivedLog{
 		Event:       "payment_received",

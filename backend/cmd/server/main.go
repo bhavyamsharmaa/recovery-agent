@@ -16,9 +16,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	// The concrete store is constructed once, here. Every other file depends on
-	// the ingest.AttemptStore interface, so Day 5 swaps this line alone.
-	attempts := ingest.NewInMemoryAttemptStore()
+	// Declared as the interface, not the concrete type, so nothing below this
+	// line can reach for an implementation detail. Day 5 changes the constructor
+	// on the right and nothing else.
+	var attempts ingest.AttemptStore = ingest.NewInMemoryAttemptStore()
 
 	http.Handle("/webhook/payment-failed", ingest.NewHandler(client, attempts))
 
