@@ -181,6 +181,12 @@ type receivedLog struct {
 	ErrorCode   string            `json:"error_code"`
 	ErrorReason string            `json:"error_reason"`
 
+	// AttemptCount and TimeSinceFailureSeconds are the two inputs the decision
+	// depends on that are not visible anywhere else in the line. Logged so a
+	// decision can be re-read later against what the model was actually told.
+	AttemptCount            int   `json:"attempt_count"`
+	TimeSinceFailureSeconds int64 `json:"time_since_failure_seconds"`
+
 	// Absent when the category was unknown (no call made) or the call failed.
 	// Confidence is a pointer so a genuine 0.0 is still emitted rather than
 	// silently dropped by omitempty.
@@ -338,7 +344,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// concurrent deliveries of the same payment cannot both pass a budget with
 	// one attempt left. A Get-then-Increment pair would read the same count in
 	// both and let both through, which is why Get stays out of this path.
-	attemptCount := h.attempts.Increment(p.ID)
+	// A store that can also report the first failure answers both from one
+	// statement; one that cannot leaves the timestamp zero and the elapsed time
+	// is reported as unknown rather than as zero seconds.
+	var attemptCount int
+	var firstFailedAt time.Time
+	if tracker, ok := h.attempts.(FirstFailureTracker); ok {
+		attemptCount, firstFailedAt = tracker.IncrementAndFirstFailure(p.ID)
+	} else {
+		attemptCount = h.attempts.Increment(p.ID)
+	}
 
 	// A category absent from the table budgets 0, which is the safe direction:
 	// hard_decline and unknown both land here and both must stop.
@@ -367,13 +382,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	received := receivedLog{
-		Event:       "payment_received",
-		PaymentID:   p.ID,
-		Category:    category,
-		AmountPaise: p.Amount,
-		ErrorCode:   p.ErrorCode,
-		ErrorReason: p.ErrorReason,
-		TS:          now(),
+		Event:                   "payment_received",
+		PaymentID:               p.ID,
+		Category:                category,
+		AmountPaise:             p.Amount,
+		ErrorCode:               p.ErrorCode,
+		ErrorReason:             p.ErrorReason,
+		AttemptCount:            attemptCount,
+		TimeSinceFailureSeconds: secondsSince(firstFailedAt),
+		TS:                      now(),
 	}
 
 	// An unknown category means no rule matched, so there is nothing to reason
@@ -396,9 +413,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// this never goes negative.
 			RemainingRetryBudget: budget - (attemptCount - 1),
 
-			// TODO(day5): needs the timestamp of the first failure, which needs
-			// persistence.
-			TimeSinceFailureSeconds: 0,
+			TimeSinceFailureSeconds: secondsSince(firstFailedAt),
 		})
 		cancel()
 
@@ -496,6 +511,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ok(w)
+}
+
+// secondsSince reports how long ago a payment first failed, for the model to
+// weigh. A zero timestamp means the store could not say, and 0 is the honest
+// answer: it is the same value the field carried before any store could
+// answer, and it reads as "no elapsed time to take into account".
+//
+// A negative result is clamped. first_failed_at comes from the database's
+// clock and time.Now() from this process's, and a few milliseconds of skew
+// between them should not reach the model as a payment that fails in the
+// future.
+func secondsSince(firstFailedAt time.Time) int64 {
+	if firstFailedAt.IsZero() {
+		return 0
+	}
+	elapsed := int64(time.Since(firstFailedAt).Seconds())
+	if elapsed < 0 {
+		return 0
+	}
+	return elapsed
 }
 
 // applyConfidenceGate overrides a low-confidence decision to escalate and

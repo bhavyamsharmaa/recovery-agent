@@ -51,9 +51,14 @@ func main() {
 	}
 
 	// Declared as the interface, not the concrete type, so nothing below this
-	// line can reach for an implementation detail. Day 5 changes the constructor
-	// on the right and nothing else.
-	var attempts ingest.AttemptStore = ingest.NewInMemoryAttemptStore()
+	// line can reach for an implementation detail. This is the Day 5 swap the
+	// interface was built for: one constructor changed, nothing else.
+	//
+	// InMemoryAttemptStore stays in the package for tests and for running
+	// locally without a database. It answers the same interface, including the
+	// first-failure timestamp, so the handler behaves identically either way —
+	// only durability differs.
+	var attempts ingest.AttemptStore = ingest.NewPostgresAttemptStore(pool)
 
 	http.Handle("/webhook/payment-failed", ingest.NewHandler(client, attempts))
 

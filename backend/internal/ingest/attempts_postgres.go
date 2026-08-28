@@ -34,6 +34,9 @@ func NewPostgresAttemptStore(db *sql.DB) *PostgresAttemptStore {
 // refactor: this type satisfies the same interface the handler already takes.
 var _ AttemptStore = (*PostgresAttemptStore)(nil)
 
+// And it can answer when the payment first failed, from the same statement.
+var _ FirstFailureTracker = (*PostgresAttemptStore)(nil)
+
 // PaymentDetails is everything failed_payments needs that an attempt count
 // alone cannot supply. failed_payments declares these NOT NULL, so a row
 // cannot be created from a payment id by itself.
@@ -120,10 +123,23 @@ func (s *PostgresAttemptStore) Get(paymentID string) int {
 // store's contract, and RecordPayment overwrites those placeholders the moment
 // it runs.
 func (s *PostgresAttemptStore) Increment(paymentID string) int {
+	n, _ := s.IncrementAndFirstFailure(paymentID)
+	return n
+}
+
+// IncrementAndFirstFailure increments and reports when the payment first
+// failed, both from the one statement. first_failed_at is only ever written by
+// the INSERT branch, so it is the original value on every later call — the
+// UPDATE branch deliberately does not touch it.
+//
+// On error the timestamp is the zero Time, which the handler reads as "elapsed
+// time unknown" rather than "zero seconds ago".
+func (s *PostgresAttemptStore) IncrementAndFirstFailure(paymentID string) (int, time.Time) {
 	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
 	defer cancel()
 
 	var n int
+	var firstFailedAt time.Time
 	err := s.db.QueryRowContext(ctx, `
 		INSERT INTO failed_payments (
 			payment_id, category, error_code, error_reason, error_source,
@@ -133,7 +149,7 @@ func (s *PostgresAttemptStore) Increment(paymentID string) int {
 		ON CONFLICT (payment_id) DO UPDATE SET
 			attempt_count = failed_payments.attempt_count + 1,
 			last_seen_at  = now()
-		RETURNING attempt_count`, paymentID).Scan(&n)
+		RETURNING attempt_count, first_failed_at`, paymentID).Scan(&n, &firstFailedAt)
 	if err != nil {
 		// The interface returns no error, and the stopping rule reads this
 		// number to decide whether a payment may be retried. Answering 0 would
@@ -145,7 +161,7 @@ func (s *PostgresAttemptStore) Increment(paymentID string) int {
 		// becomes a queue of escalations rather than a hole in the compliance
 		// rules.
 		fmt.Fprintf(os.Stderr, "ingest: increment attempt count for %s: %v\n", paymentID, err)
-		return math.MaxInt
+		return math.MaxInt, time.Time{}
 	}
-	return n
+	return n, firstFailedAt
 }
