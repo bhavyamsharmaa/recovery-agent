@@ -37,6 +37,19 @@ var _ AttemptStore = (*PostgresAttemptStore)(nil)
 // And it can answer when the payment first failed, from the same statement.
 var _ FirstFailureTracker = (*PostgresAttemptStore)(nil)
 
+// PaymentRecorder is an optional capability, like FirstFailureTracker: a store
+// that can keep what a payment was, not only how often it has been seen.
+//
+// It is separate from AttemptStore for the same reason as before — Get and
+// Increment keep their Day 3 signatures — and separate from FirstFailureTracker
+// because the two answer different questions and a store could reasonably
+// offer one without the other.
+type PaymentRecorder interface {
+	RecordPayment(ctx context.Context, d PaymentDetails) error
+}
+
+var _ PaymentRecorder = (*PostgresAttemptStore)(nil)
+
 // PaymentDetails is everything failed_payments needs that an attempt count
 // alone cannot supply. failed_payments declares these NOT NULL, so a row
 // cannot be created from a payment id by itself.

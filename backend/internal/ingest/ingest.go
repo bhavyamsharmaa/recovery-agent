@@ -371,6 +371,29 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// concurrent deliveries of the same payment cannot both pass a budget with
 	// one attempt left. A Get-then-Increment pair would read the same count in
 	// both and let both through, which is why Get stays out of this path.
+	// What the payment was, before how often it has been seen. Recording first
+	// means the row is complete from the start, so Increment's placeholder
+	// branch never fires in production and failed_payments never holds a row
+	// that says only that something failed twice without saying what.
+	//
+	// A failure here is reported and swallowed: the attempt still has to be
+	// counted, and losing the descriptive columns is a smaller harm than losing
+	// the count that enforces the retry budget.
+	if recorder, ok := h.attempts.(PaymentRecorder); ok {
+		err := recorder.RecordPayment(r.Context(), PaymentDetails{
+			PaymentID:     p.ID,
+			Category:      category,
+			ErrorCode:     p.ErrorCode,
+			ErrorReason:   p.ErrorReason,
+			ErrorSource:   p.ErrorSource,
+			PaymentMethod: p.Method,
+			AmountPaise:   int64(p.Amount),
+		})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+		}
+	}
+
 	// A store that can also report the first failure answers both from one
 	// statement; one that cannot leaves the timestamp zero and the elapsed time
 	// is reported as unknown rather than as zero seconds.
