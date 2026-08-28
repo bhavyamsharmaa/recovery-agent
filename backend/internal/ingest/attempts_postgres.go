@@ -129,12 +129,19 @@ func (s *PostgresAttemptStore) Get(paymentID string) int {
 // — the identical race that was found and fixed in the in-memory store on
 // Day 3, just relocated into SQL.
 //
-// The INSERT branch supplies empty strings for the columns failed_payments
-// requires. In the handler that branch is unreachable: RecordPayment runs
-// first, so the row already exists and only the UPDATE branch fires. It exists
-// so that Increment alone is still correct and still matches the in-memory
-// store's contract, and RecordPayment overwrites those placeholders the moment
-// it runs.
+// This is a plain UPDATE, not an upsert, and that is forced by migration 002.
+// PostgreSQL evaluates a CHECK constraint against the proposed row BEFORE
+// resolving ON CONFLICT, so an INSERT ... ON CONFLICT DO UPDATE whose proposed
+// tuple carries category = '' is rejected even when the row already exists and
+// only the UPDATE would ever have run. Verified directly against the database
+// rather than inferred.
+//
+// The consequence is the one the constraint was added for: counting an attempt
+// now requires the payment to have been recorded first. A payment that reaches
+// here without RecordPayment having succeeded matches no row, which is reported
+// as a failure and fails closed below, instead of quietly creating a row that
+// says a payment failed without saying what it was.
+
 func (s *PostgresAttemptStore) Increment(paymentID string) int {
 	n, _ := s.IncrementAndFirstFailure(paymentID)
 	return n
@@ -154,15 +161,18 @@ func (s *PostgresAttemptStore) IncrementAndFirstFailure(paymentID string) (int, 
 	var n int
 	var firstFailedAt time.Time
 	err := s.db.QueryRowContext(ctx, `
-		INSERT INTO failed_payments (
-			payment_id, category, error_code, error_reason, error_source,
-			payment_method, amount_paise, first_failed_at, last_seen_at, attempt_count
-		)
-		VALUES ($1, '', '', '', '', '', 0, now(), now(), 1)
-		ON CONFLICT (payment_id) DO UPDATE SET
-			attempt_count = failed_payments.attempt_count + 1,
-			last_seen_at  = now()
+		UPDATE failed_payments
+		SET attempt_count = attempt_count + 1,
+		    last_seen_at  = now()
+		WHERE payment_id = $1
 		RETURNING attempt_count, first_failed_at`, paymentID).Scan(&n, &firstFailedAt)
+
+	// No row means RecordPayment never succeeded for this payment. Worth its own
+	// message: "no rows in result set" on its own would send a reader looking
+	// for a query bug rather than for the recording failure that preceded it.
+	if errors.Is(err, sql.ErrNoRows) {
+		err = fmt.Errorf("no failed_payments row: the payment was never recorded")
+	}
 	if err != nil {
 		// The interface returns no error, and the stopping rule reads this
 		// number to decide whether a payment may be retried. Answering 0 would

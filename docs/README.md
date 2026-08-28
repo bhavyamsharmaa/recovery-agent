@@ -44,6 +44,32 @@ An agent that classifies failed payments and recovers them with policy-driven re
   transaction. This is deliberate: a decision that silently disappears with its
   payment is an audit trail that cannot be trusted.
 
+- **`AttemptStore` cannot report an error, so `Increment` fails closed via a
+  sentinel.** The interface returns a plain `int` — it was defined on Day 3
+  against an in-memory map, where nothing could fail. The Postgres
+  implementation can, and answering `0` would read as "no attempts yet" and wave
+  a `hard_decline` (budget 0) straight past the check that exists to stop it. So
+  a database failure returns `math.MaxInt`, which exceeds every budget and stops
+  the payment. **A database outage therefore appears as a spike in
+  `retry_budget_exhausted` escalations, not as errors** — the raw cause is on
+  stderr, and `attempt_count: 9223372036854775807` in a
+  `stopping_rule_triggered` line is the tell. This is design debt: the
+  interface should carry `error` and `context`, and is left alone only to keep
+  the Day 3 stopping-rule and confidence-gate code untouched.
+
+- **Counting an attempt requires the payment to have been recorded first.**
+  `failed_payments.category` carries a `category_not_empty` CHECK
+  (migration 002), because `TEXT NOT NULL` accepts `''` and an empty category is
+  never useful — the retry budget is looked up by it. `Increment` is a plain
+  `UPDATE`, not an upsert, because PostgreSQL evaluates a CHECK against the
+  proposed row *before* resolving `ON CONFLICT`, so an upsert carrying
+  placeholder values is rejected even when the row already exists and only the
+  UPDATE would have run. If `RecordPayment` fails, a `record_payment_failed`
+  log line is emitted, `Increment` then matches no row, and the payment fails
+  closed and escalates. Nothing is written at all — which is the point: the
+  earlier behaviour was a blank-but-valid row that self-healed only if that
+  payment happened to fail again.
+
 - **Webhook deduplication is likewise in-memory.** After a restart, a redelivery
   of an event seen before the restart is processed as new.
 

@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"sync"
@@ -52,6 +53,27 @@ func newTestStore(t *testing.T) (*PostgresAttemptStore, string) {
 	return NewPostgresAttemptStore(pool), paymentID
 }
 
+// seed writes the descriptive columns, as the handler does before it counts an
+// attempt. Since migration 002 this is a precondition rather than a nicety:
+// category_not_empty rejects the placeholder row Increment would otherwise
+// insert, so a test that increments an unseen payment is testing the failure
+// path, not the counter.
+func seed(t *testing.T, s *PostgresAttemptStore, paymentID string) {
+	t.Helper()
+	err := s.RecordPayment(context.Background(), PaymentDetails{
+		PaymentID:     paymentID,
+		Category:      classify.CategoryInsufficientFunds,
+		ErrorCode:     "BAD_REQUEST_ERROR",
+		ErrorReason:   "insufficient_funds",
+		ErrorSource:   "customer",
+		PaymentMethod: "card",
+		AmountPaise:   499900,
+	})
+	if err != nil {
+		t.Fatalf("seed %s: %v", paymentID, err)
+	}
+}
+
 func TestPostgresAttemptStoreGetUnseenIsZero(t *testing.T) {
 	s, paymentID := newTestStore(t)
 
@@ -62,6 +84,7 @@ func TestPostgresAttemptStoreGetUnseenIsZero(t *testing.T) {
 
 func TestPostgresAttemptStoreIncrementCounts(t *testing.T) {
 	s, paymentID := newTestStore(t)
+	seed(t, s, paymentID)
 
 	// The first Increment returns 1, not 0 — the same contract the in-memory
 	// store holds, since the handler treats the return value as "this attempt's
@@ -85,6 +108,8 @@ func TestPostgresAttemptStoreCountsPerPaymentID(t *testing.T) {
 	s, paymentID := newTestStore(t)
 	other := paymentID + "_other"
 	t.Cleanup(func() { s.db.Exec(`DELETE FROM failed_payments WHERE payment_id = $1`, other) })
+	seed(t, s, paymentID)
+	seed(t, s, other)
 
 	s.Increment(paymentID)
 	s.Increment(paymentID)
@@ -105,6 +130,11 @@ func TestPostgresAttemptStoreCountsPerPaymentID(t *testing.T) {
 func TestPostgresAttemptStoreConcurrentIncrement(t *testing.T) {
 	const n = 20
 	s, paymentID := newTestStore(t)
+
+	// The row exists before the goroutines start, so every one of them takes the
+	// UPDATE branch — which is exactly what production does, and what the row
+	// lock has to serialise.
+	seed(t, s, paymentID)
 
 	// Without headroom the pool serialises the callers itself and the test
 	// proves nothing about the SQL.
@@ -144,10 +174,22 @@ func TestPostgresAttemptStoreRecordPaymentFillsDetails(t *testing.T) {
 	s, paymentID := newTestStore(t)
 	ctx := context.Background()
 
-	// Increment first, so the row exists with placeholders — the order the
-	// handler will not use, which is exactly why it needs covering.
-	if got := s.Increment(paymentID); got != 1 {
-		t.Fatalf("Increment = %d, want 1", got)
+	// Incrementing an unseen payment used to insert a blank-but-valid row.
+	// Since migration 002 the category_not_empty CHECK rejects it, and Increment
+	// fails closed — the sentinel, not a count — so a payment whose details
+	// could not be recorded stops instead of proceeding on an uninterpretable
+	// record.
+	if got := s.Increment(paymentID); got != math.MaxInt {
+		t.Fatalf("Increment on an unrecorded payment = %d, want the fail-closed sentinel", got)
+	}
+	var exists bool
+	if err := s.db.QueryRow(
+		`SELECT EXISTS (SELECT 1 FROM failed_payments WHERE payment_id = $1)`,
+		paymentID).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Error("a row was written despite the CHECK; the blank-row path is still open")
 	}
 
 	details := PaymentDetails{
@@ -187,10 +229,14 @@ func TestPostgresAttemptStoreRecordPaymentFillsDetails(t *testing.T) {
 			details.ErrorSource, details.PaymentMethod, details.AmountPaise)
 	}
 
-	// RecordPayment must not disturb the count. The two concerns are separate
-	// methods precisely so that one cannot silently reset the other.
-	if attempts != 1 {
-		t.Errorf("attempt_count = %d after RecordPayment, want 1 unchanged", attempts)
+	// RecordPayment creates the row with a zero count: counting is Increment's
+	// job, and the two are separate methods precisely so one cannot silently
+	// change the other.
+	if attempts != 0 {
+		t.Errorf("attempt_count = %d after RecordPayment alone, want 0", attempts)
+	}
+	if got := s.Increment(paymentID); got != 1 {
+		t.Errorf("Increment after RecordPayment = %d, want 1", got)
 	}
 	if !lastSeen.After(firstFailed) && !lastSeen.Equal(firstFailed) {
 		t.Errorf("last_seen_at %v is before first_failed_at %v", lastSeen, firstFailed)

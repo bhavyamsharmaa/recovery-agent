@@ -242,6 +242,17 @@ type fallbackDecisionLog struct {
 	TS            string            `json:"ts"`
 }
 
+// recordPaymentFailedLog marks a payment whose descriptive columns could not be
+// written. The attempt is still counted and the payment still gets a decision,
+// so the request is not failed — but the row is degraded, and without a line
+// like this the only way to find it later is a manual sweep for empty columns.
+type recordPaymentFailedLog struct {
+	Event     string `json:"event"`
+	PaymentID string `json:"payment_id"`
+	Error     string `json:"error"`
+	TS        string `json:"ts"`
+}
+
 type decisionFailedLog struct {
 	Event     string            `json:"event"`
 	PaymentID string            `json:"payment_id"`
@@ -390,7 +401,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			AmountPaise:   int64(p.Amount),
 		})
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
+			// Structured, not just stderr: a degraded payment has to be findable
+			// by querying the log rather than by sweeping the table for empty
+			// columns. The request continues — the attempt still needs counting
+			// and the payment may still need escalating.
+			logLine(recordPaymentFailedLog{
+				Event:     "record_payment_failed",
+				PaymentID: p.ID,
+				Error:     err.Error(),
+				TS:        now(),
+			})
 		}
 	}
 
