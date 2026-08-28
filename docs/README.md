@@ -27,6 +27,23 @@ An agent that classifies failed payments and recovers them with policy-driven re
   [issue #1](https://github.com/bhavyamsharmaa/recovery-agent/issues/1) for the
   full discovery-to-fix trail.
 
+- **`failed_payments.amount_paise` reflects the most recent delivery's amount,
+  not the first.** The row is refreshed on every delivery, because a payment
+  that fails again may fail differently and the decision being made is about
+  the latest failure. This is correct for real Razorpay traffic, where the
+  amount is stable across deliveries of one payment. It can look like drift
+  when testing against `cmd/simulate`, which randomises the amount per call —
+  so a payment traced after two simulated deliveries shows the second call's
+  amount, not the first. The same applies to the `error_*` and `category`
+  columns.
+
+- **The tables have no `ON DELETE CASCADE`.** `decisions` and `outcomes`
+  reference `failed_payments`, so a plain
+  `DELETE FROM failed_payments WHERE ...` fails on the foreign key whenever the
+  payment has decisions recorded against it. Delete children first, in a
+  transaction. This is deliberate: a decision that silently disappears with its
+  payment is an audit trail that cannot be trusted.
+
 - **Webhook deduplication is likewise in-memory.** After a restart, a redelivery
   of an event seen before the restart is processed as new.
 
