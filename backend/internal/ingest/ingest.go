@@ -164,6 +164,10 @@ type Handler struct {
 
 	attempts AttemptStore
 	decider  Decider
+
+	// decisions is optional. Nil means decisions are logged but not stored,
+	// which is how every test that predates persistence still builds a Handler.
+	decisions DecisionRecorder
 }
 
 // NewHandler takes the AttemptStore interface rather than a concrete store, so
@@ -171,6 +175,29 @@ type Handler struct {
 // this package changing.
 func NewHandler(d Decider, a AttemptStore) *Handler {
 	return &Handler{decider: d, attempts: a}
+}
+
+// WithDecisionRecorder attaches durable decision storage. It is a separate
+// call rather than a third parameter so that NewHandler keeps the signature
+// every existing caller and test already uses.
+func (h *Handler) WithDecisionRecorder(r DecisionRecorder) *Handler {
+	h.decisions = r
+	return h
+}
+
+// recordDecision persists one decision, if storage is attached.
+//
+// A failure to store is reported and swallowed. The webhook has already been
+// answered on the strength of the decision being made and logged; failing it
+// now would make Razorpay redeliver a payment that was handled correctly, and
+// turn a storage outage into a duplicate-processing problem.
+func (h *Handler) recordDecision(ctx context.Context, d DecisionRecord) {
+	if h.decisions == nil {
+		return
+	}
+	if err := h.decisions.RecordDecision(ctx, d); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+	}
 }
 
 type receivedLog struct {
@@ -377,6 +404,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 			TS: now(),
 		})
+
+		// Stored as escalate: the stopping rule takes no action beyond handing
+		// the payment to a human, and the action column has to say what was
+		// done. Confidence is nil — nothing was inferred, so there is no score.
+		// Reasoning is empty for the same reason: none was produced.
+		h.recordDecision(r.Context(), DecisionRecord{
+			PaymentID:        p.ID,
+			AttemptNumber:    attemptCount,
+			Action:           decide.ActionEscalate,
+			Source:           DecisionSourceStoppingRule,
+			CustomerMessage:  escalationMessage(category),
+			EscalationReason: EscalationReasonBudgetExhausted,
+		})
+
 		ok(w)
 		return
 	}
@@ -451,6 +492,28 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			received.DecisionConfidence = &confidence
 			received.DecisionAlternateMethod = gated.AlternateMethod
 			received.DecisionSource = DecisionSourceLLM
+
+			// The model's own confidence, not the gate's verdict on it. The gate
+			// changes the action; the score stays the evidence for why.
+			modelConfidence := d.Confidence
+			rec := DecisionRecord{
+				PaymentID:       p.ID,
+				AttemptNumber:   attemptCount,
+				Action:          gated.Action,
+				Source:          DecisionSourceLLM,
+				Confidence:      &modelConfidence,
+				Reasoning:       gated.Reasoning,
+				CustomerMessage: gated.CustomerMessage,
+				AlternateMethod: gated.AlternateMethod,
+			}
+			// Only an overridden decision has these. A decision the model made
+			// and the gate left alone was never escalated and had no earlier
+			// action, so both columns stay NULL.
+			if overridden {
+				rec.EscalationReason = EscalationReasonLowConfidence
+				rec.OriginalAction = d.Action
+			}
+			h.recordDecision(r.Context(), rec)
 		}
 
 		// Both the original call and its retry failed to produce a usable
@@ -464,6 +527,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			received.DecisionConfidence = &confidence
 			received.DecisionAlternateMethod = fb.AlternateMethod
 			received.DecisionSource = DecisionSourceFallbackRule
+
+			// Confidence is deliberately nil here while the JSON log reports 0.
+			// The log carries decision_source on the same line, so 0 cannot be
+			// misread there; a column read on its own can be.
+			h.recordDecision(r.Context(), DecisionRecord{
+				PaymentID:       p.ID,
+				AttemptNumber:   attemptCount,
+				Action:          fb.Action,
+				Source:          DecisionSourceFallbackRule,
+				Reasoning:       fb.Reasoning,
+				CustomerMessage: fb.CustomerMessage,
+			})
 		}
 	}
 

@@ -60,7 +60,12 @@ func main() {
 	// only durability differs.
 	var attempts ingest.AttemptStore = ingest.NewPostgresAttemptStore(pool)
 
-	http.Handle("/webhook/payment-failed", ingest.NewHandler(client, attempts))
+	// Decisions from all three sources are stored here, alongside the JSON log
+	// lines, so the audit trail survives the process.
+	decisions := ingest.NewPostgresDecisionStore(pool)
+
+	handler := ingest.NewHandler(client, attempts).WithDecisionRecorder(decisions)
+	http.Handle("/webhook/payment-failed", handler)
 
 	fmt.Println("server up")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
