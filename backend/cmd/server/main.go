@@ -7,6 +7,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/bhavyamsharmaa/recovery-agent/internal/api"
 	"github.com/bhavyamsharmaa/recovery-agent/internal/db"
 	"github.com/bhavyamsharmaa/recovery-agent/internal/decide"
 	"github.com/bhavyamsharmaa/recovery-agent/internal/ingest"
@@ -66,6 +67,12 @@ func main() {
 
 	handler := ingest.NewHandler(client, attempts).WithDecisionRecorder(decisions)
 	http.Handle("/webhook/payment-failed", handler)
+
+	// The read-only JSON API, mounted as a subtree so its CORS headers apply to
+	// every /api/ route and to nothing else. The webhook above is called by
+	// Razorpay, not by a browser, and has no business advertising an allowed
+	// origin.
+	http.Handle("/api/", api.NewHandler(pool))
 
 	fmt.Println("server up")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
