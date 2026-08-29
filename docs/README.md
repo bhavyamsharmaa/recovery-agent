@@ -102,6 +102,40 @@ An agent that classifies failed payments and recovers them with policy-driven re
   which is why the live calibration test asks for a majority of runs below the
   threshold rather than all of them.
 
+- **The read-only JSON API has no authentication.** `internal/api` serves
+  `GET /api/payments` and `GET /api/payments/{id}` to anyone who can reach port
+  8080. Those responses carry every failed payment's amount, error detail, the
+  model's reasoning, and the message sent to the customer. This is acceptable
+  for local development against a development database and for nothing else:
+  before deployment it needs an authenticated operator session, and the
+  permitted CORS origin — `http://localhost:5173` by default, overridable with
+  `FRONTEND_ORIGIN` — tightened to the real frontend. The endpoints are
+  read-only, which limits the exposure to disclosure rather than mutation, but
+  disclosure of payment data is not a small thing. The CORS headers are attached
+  only to `/api/` routes; the webhook endpoint is called by Razorpay, not a
+  browser, and advertises no origin.
+
+- **The API's queries are shared with `cmd/trace-payment`, in `internal/trace`.**
+  They began in the command, which could not be imported because it is
+  `package main`. Rather than copy them, they moved to
+  [backend/internal/trace/trace.go](../backend/internal/trace/trace.go) and the
+  command became a formatter over it. Both the terminal trace and the dashboard
+  therefore answer from identical SQL — if the two ever disagree about a
+  payment's history, that is a bug in one of the renderers, not a difference of
+  opinion between two copies of a query. Add columns there, not in a second
+  place.
+
+- **`GET /api/payments` returns every matching row, unpaginated.** The table is
+  small today. A `LIMIT` and a cursor over `(last_seen_at, payment_id)` — which
+  is already the sort order precisely so that it can become one — is the change
+  to make before it is not.
+
+- **Nothing writes the `outcomes` table, so the dashboard cannot show one.**
+  Both `cmd/trace-payment` and the detail view say "no outcome recorded yet"
+  rather than inventing a status, which is honest but does mean no part of the
+  system yet learns whether a decision actually recovered the payment. The read
+  path is built and waiting on both sides.
+
 ## Known test-fidelity limitations
 
 - **`TestDedupeConcurrentSameEventID` is probabilistic.** It was validated by
