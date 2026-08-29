@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/bhavyamsharmaa/recovery-agent/internal/classify"
@@ -157,10 +156,11 @@ const eventIDHeader = "X-Razorpay-Event-Id"
 
 // Handler serves POST /webhook/payment-failed.
 type Handler struct {
-	// seen holds every event id processed so far. In-memory only: a restart
-	// forgets everything and redeliveries would be reprocessed. Day 5 replaces
-	// this with the database.
-	seen sync.Map
+	// events deduplicates deliveries by event id. It defaults to the in-memory
+	// store so that every test and every caller predating persistence keeps
+	// working; production swaps in the Postgres one via WithEventStore, which is
+	// what makes a redelivery still be recognised after a restart.
+	events EventStore
 
 	attempts AttemptStore
 	decider  Decider
@@ -174,7 +174,17 @@ type Handler struct {
 // Day 5's Postgres implementation drops in at the construction site without
 // this package changing.
 func NewHandler(d Decider, a AttemptStore) *Handler {
-	return &Handler{decider: d, attempts: a}
+	return &Handler{decider: d, attempts: a, events: NewInMemoryEventStore()}
+}
+
+// WithEventStore swaps in durable deduplication. Like WithDecisionRecorder it
+// is a separate call rather than a third parameter, so NewHandler keeps the
+// signature every existing caller and test already uses — and so the default
+// stays the in-memory store rather than nil, which would mean every handler
+// built without one silently stopped deduplicating.
+func (h *Handler) WithEventStore(s EventStore) *Handler {
+	h.events = s
+	return h
 }
 
 // WithDecisionRecorder attaches durable decision storage. It is a separate
@@ -356,11 +366,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// retry budget still bounds what happens next.
 	eventID := r.Header.Get(eventIDHeader)
 	if eventID != "" {
-		// LoadOrStore is one atomic step. A Load-then-Store pair would let two
-		// concurrent redeliveries of the same event both read "not seen" and both
-		// be treated as new, which is the exact failure this check exists to
-		// prevent.
-		if _, loaded := h.seen.LoadOrStore(eventID, struct{}{}); loaded {
+		// RecordEvent is one atomic step in both implementations — a sync.Map
+		// LoadOrStore in memory, an INSERT ... ON CONFLICT DO NOTHING RETURNING
+		// in Postgres. A check-then-record pair would let two concurrent
+		// redeliveries of the same event both read "not seen" and both be
+		// treated as new, which is the exact failure this exists to prevent.
+		if !h.events.RecordEvent(eventID, p.ID) {
 			logLine(duplicateLog{
 				Event:     "duplicate",
 				EventID:   eventID,

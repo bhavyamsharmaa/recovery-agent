@@ -65,7 +65,17 @@ func main() {
 	// lines, so the audit trail survives the process.
 	decisions := ingest.NewPostgresDecisionStore(pool)
 
-	handler := ingest.NewHandler(client, attempts).WithDecisionRecorder(decisions)
+	// Webhook deduplication, in the database rather than in a map on the
+	// handler. This is the other half of the Day 5 swap, and it was a real bug
+	// to have left behind: with counts persisted and dedupe in memory, a restart
+	// kept the attempt count for an event while forgetting that the event had
+	// been handled, so a redelivery incremented a count for a delivery that was
+	// not new.
+	events := ingest.NewPostgresEventStore(pool)
+
+	handler := ingest.NewHandler(client, attempts).
+		WithDecisionRecorder(decisions).
+		WithEventStore(events)
 	http.Handle("/webhook/payment-failed", handler)
 
 	// The read-only JSON API, mounted as a subtree so its CORS headers apply to

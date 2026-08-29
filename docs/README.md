@@ -70,8 +70,35 @@ An agent that classifies failed payments and recovers them with policy-driven re
   earlier behaviour was a blank-but-valid row that self-healed only if that
   payment happened to fail again.
 
-- **Webhook deduplication is likewise in-memory.** After a restart, a redelivery
-  of an event seen before the restart is processed as new.
+- **Webhook deduplication was in-memory and is now in Postgres (fixed).** It
+  lived in a `sync.Map` on the handler, which was consistent while attempt
+  counts were in memory beside it — a restart forgot both together. Day 5 moved
+  the counts to Postgres and left the dedupe behind, and *that asymmetry was the
+  bug*: a restart kept the attempt count for an event while forgetting the event
+  had been handled, so a redelivery was processed as new and incremented a count
+  for a delivery that was not new. Fixed behind an `ingest.EventStore` interface
+  with a `webhook_events` table (migration 003) and a single
+  `INSERT ... ON CONFLICT (event_id) DO NOTHING RETURNING event_id` — one
+  statement, so the check and the record cannot be interleaved.
+  `InMemoryEventStore` is retained for tests and for running without a database.
+
+  The concurrency test was itself wrong at first and passed against a
+  deliberately naive `SELECT`-then-`INSERT`: `database/sql` opens connections
+  lazily, so twenty goroutines released at once against a cold pool queue behind
+  connection setup and never overlap. With the pool warmed to twenty live
+  connections first, the naive version fails as it should — 17, 12 and 17 of 20
+  deliveries treated as new across three runs — and the atomic version passes.
+  A concurrency test that has not been watched to fail is not evidence of
+  anything.
+
+  `PostgresEventStore.RecordEvent` fails *open* on a database error — the
+  delivery is processed — which is the opposite of `AttemptStore.Increment`
+  fails-closed above, deliberately. An unreadable attempt count must stop the
+  payment, because letting it through spends a budget that protects the
+  customer. An unmakeable dedupe check must let the payment through, because
+  dropping it discards a real failure permanently. The worst case here is one
+  double-counted attempt, which the retry budget still bounds. Such failures are
+  logged as `dedupe_check_failed` with `processed_anyway: true`.
 
 - **The confidence threshold is 0.75, calibrated rather than defaulted.** It was
   set against the observed score distribution (0.68–0.95) across the Day 2 test
