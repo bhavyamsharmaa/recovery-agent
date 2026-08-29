@@ -5,11 +5,16 @@
 // Nothing here reads a log file. That is the point: if the story is not legible
 // from the tables, the tables are not recording enough, and no amount of stdout
 // will help six months from now.
+//
+// The queries moved to internal/trace when the JSON API needed the same rows.
+// What is left here is the formatting, which is all this command ever really
+// was.
 package main
 
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -17,6 +22,7 @@ import (
 	"time"
 
 	"github.com/bhavyamsharmaa/recovery-agent/internal/db"
+	"github.com/bhavyamsharmaa/recovery-agent/internal/trace"
 )
 
 const queryTimeout = 30 * time.Second
@@ -41,166 +47,98 @@ func main() {
 	}
 	defer pool.Close()
 
-	if err := trace(ctx, pool, *paymentID); err != nil {
+	if err := run(ctx, pool, *paymentID); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
-func trace(ctx context.Context, pool *sql.DB, paymentID string) error {
-	if err := printPayment(ctx, pool, paymentID); err != nil {
-		return err
-	}
-	fmt.Println()
-	if err := printDecisions(ctx, pool, paymentID); err != nil {
-		return err
-	}
-	fmt.Println()
-	return printOutcomes(ctx, pool, paymentID)
-}
-
-func printPayment(ctx context.Context, pool *sql.DB, paymentID string) error {
-	var (
-		category, code, reason, source, method string
-		amount                                 int64
-		attempts                               int
-		first, last                            time.Time
-	)
-	err := pool.QueryRowContext(ctx, `
-		SELECT category, error_code, error_reason, error_source, payment_method,
-		       amount_paise, attempt_count, first_failed_at, last_seen_at
-		FROM failed_payments WHERE payment_id = $1`, paymentID).
-		Scan(&category, &code, &reason, &source, &method, &amount, &attempts, &first, &last)
+func run(ctx context.Context, pool *sql.DB, paymentID string) error {
+	full, err := trace.Load(ctx, pool, paymentID)
 
 	// A payment id with no row is the ordinary "never seen" answer, not a
 	// failure of this tool, so it says so plainly and exits clean.
-	if err == sql.ErrNoRows {
+	if errors.Is(err, trace.ErrNotFound) {
 		fmt.Printf("Payment: %s\n  no record — this payment has never been ingested\n", paymentID)
-		os.Exit(0)
+		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("read payment: %w", err)
+		return err
 	}
 
-	fmt.Printf("Payment: %s\n", paymentID)
-	fmt.Printf("Category: %s | Amount: %s | Method: %s\n",
-		orUnrecorded(category), rupees(amount), orUnrecorded(method))
-	fmt.Printf("Failure:  %s / %s (source: %s)\n",
-		orUnrecorded(code), orUnrecorded(reason), orUnrecorded(source))
-	fmt.Printf("First failed: %s | Last seen: %s | Attempts: %d\n",
-		utc(first), utc(last), attempts)
+	printPayment(full.Payment)
+	fmt.Println()
+	printDecisions(full.Decisions)
+	fmt.Println()
+	printOutcomes(full.Outcomes)
 	return nil
 }
 
-func printDecisions(ctx context.Context, pool *sql.DB, paymentID string) error {
-	rows, err := pool.QueryContext(ctx, `
-		SELECT attempt_number, source, action, confidence, escalation_reason,
-		       original_action, alternate_method, customer_message, created_at
-		FROM decisions WHERE payment_id = $1 ORDER BY id`, paymentID)
-	if err != nil {
-		return fmt.Errorf("read decisions: %w", err)
-	}
-	defer rows.Close()
+func printPayment(p trace.Payment) {
+	fmt.Printf("Payment: %s\n", p.PaymentID)
+	fmt.Printf("Category: %s | Amount: %s | Method: %s\n",
+		orUnrecorded(p.Category), rupees(p.AmountPaise), orUnrecorded(p.PaymentMethod))
+	fmt.Printf("Failure:  %s / %s (source: %s)\n",
+		orUnrecorded(p.ErrorCode), orUnrecorded(p.ErrorReason), orUnrecorded(p.ErrorSource))
+	fmt.Printf("First failed: %s | Last seen: %s | Attempts: %d\n",
+		utc(p.FirstFailedAt), utc(p.LastSeenAt), p.AttemptCount)
+}
 
-	type decision struct {
-		attempt                                           int
-		source, action                                    string
-		confidence                                        sql.NullFloat64
-		escalationReason, originalAction, alternateMethod sql.NullString
-		customerMessage                                   sql.NullString
-		createdAt                                         time.Time
-	}
-
-	var all []decision
-	for rows.Next() {
-		var d decision
-		if err := rows.Scan(&d.attempt, &d.source, &d.action, &d.confidence,
-			&d.escalationReason, &d.originalAction, &d.alternateMethod,
-			&d.customerMessage, &d.createdAt); err != nil {
-			return fmt.Errorf("scan decision: %w", err)
-		}
-		all = append(all, d)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate decisions: %w", err)
-	}
-
+func printDecisions(all []trace.Decision) {
 	if len(all) == 0 {
 		fmt.Println("Decision history: none recorded")
-		return nil
+		return
 	}
 
 	// Column widths are computed from the rows actually present rather than
 	// fixed, so one long source name does not leave every other line ragged.
 	sourceWidth, actionWidth := 0, 0
 	for _, d := range all {
-		sourceWidth = max(sourceWidth, len(d.source))
-		actionWidth = max(actionWidth, len(d.action))
+		sourceWidth = max(sourceWidth, len(d.Source))
+		actionWidth = max(actionWidth, len(d.Action))
 	}
 
 	fmt.Println("Decision history:")
 	for _, d := range all {
 		fmt.Printf("  #%d [%-*s] action=%-*s confidence=%-4s",
-			d.attempt, sourceWidth, d.source, actionWidth, d.action, confidence(d.confidence))
+			d.AttemptNumber, sourceWidth, d.Source, actionWidth, d.Action, confidence(d.Confidence))
 
 		// Only shown when set. A NULL here is not missing data — it is the
 		// decision saying this did not apply to it.
-		if d.escalationReason.Valid {
-			fmt.Printf(" reason=%s", d.escalationReason.String)
+		if d.EscalationReason.Valid {
+			fmt.Printf(" reason=%s", d.EscalationReason.String)
 		}
-		if d.originalAction.Valid {
-			fmt.Printf(" overrode=%s", d.originalAction.String)
+		if d.OriginalAction.Valid {
+			fmt.Printf(" overrode=%s", d.OriginalAction.String)
 		}
-		if d.alternateMethod.Valid {
-			fmt.Printf(" alternate=%s", d.alternateMethod.String)
+		if d.AlternateMethod.Valid {
+			fmt.Printf(" alternate=%s", d.AlternateMethod.String)
 		}
-		fmt.Printf("  (%s)\n", utc(d.createdAt))
+		fmt.Printf("  (%s)\n", utc(d.CreatedAt))
 
-		if d.customerMessage.Valid {
-			fmt.Printf("      told the customer: %s\n", d.customerMessage.String)
+		if d.CustomerMessage.Valid {
+			fmt.Printf("      told the customer: %s\n", d.CustomerMessage.String)
 		}
 	}
-	return nil
 }
 
-func printOutcomes(ctx context.Context, pool *sql.DB, paymentID string) error {
-	rows, err := pool.QueryContext(ctx, `
-		SELECT outcome, decision_id, recorded_at
-		FROM outcomes WHERE payment_id = $1 ORDER BY id`, paymentID)
-	if err != nil {
-		return fmt.Errorf("read outcomes: %w", err)
-	}
-	defer rows.Close()
-
-	n := 0
-	for rows.Next() {
-		var outcome string
-		var decisionID sql.NullInt64
-		var at time.Time
-		if err := rows.Scan(&outcome, &decisionID, &at); err != nil {
-			return fmt.Errorf("scan outcome: %w", err)
-		}
-		if n == 0 {
-			fmt.Println("Outcomes:")
-		}
-		n++
-		against := "unlinked"
-		if decisionID.Valid {
-			against = fmt.Sprintf("decision id %d", decisionID.Int64)
-		}
-		fmt.Printf("  %s (%s) — %s\n", outcome, against, utc(at))
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate outcomes: %w", err)
-	}
-
-	if n == 0 {
+func printOutcomes(all []trace.Outcome) {
+	if len(all) == 0 {
 		// Nothing feeds this table yet: no part of the system learns whether a
 		// recovery actually worked. Saying so is more useful than an empty
 		// heading that looks like a query returned nothing.
 		fmt.Println("Outcomes: none recorded yet")
+		return
 	}
-	return nil
+
+	fmt.Println("Outcomes:")
+	for _, o := range all {
+		against := "unlinked"
+		if o.DecisionID.Valid {
+			against = fmt.Sprintf("decision id %d", o.DecisionID.Int64)
+		}
+		fmt.Printf("  %s (%s) — %s\n", o.Outcome, against, utc(o.RecordedAt))
+	}
 }
 
 // rupees renders paise as currency. The database stores paise because that is
