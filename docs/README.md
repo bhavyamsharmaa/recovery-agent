@@ -163,6 +163,48 @@ An agent that classifies failed payments and recovers them with policy-driven re
   system yet learns whether a decision actually recovered the payment. The read
   path is built and waiting on both sides.
 
+- **Recovery outcomes are simulated — no gateway is ever called.** `internal/simulate`
+  decides whether a decision "recovered" a payment with a seeded coin flip
+  against probabilities written down by hand. No card is charged and no retry is
+  attempted against Razorpay. The purpose is to compare two routing policies over
+  the same payments and the same random stream; it measures a policy, not an
+  outcome.
+
+  | Action | Simulated recovery probability | Why this position in the ordering |
+  |---|---|---|
+  | `suggest_alternate_method` | 0.65 | A different instrument sidesteps whatever is wrong with the first one. |
+  | `retry_now` | 0.55 | A customer-input error (wrong CVV/OTP) is fixable immediately. |
+  | `retry_delayed` | 0.40 | Waiting on an uncertain bank-side condition to clear is the weakest bet. |
+  | `escalate` | *(none)* | No automated attempt is made, so there is no result to draw. |
+  | `no_retry` | *(none)* | Likewise. |
+  | *naive baseline* | 0.20 | Blind retry of every category, including ones that cannot succeed. |
+
+  The ordering is the claim being made about the world and is pinned by a test;
+  the exact digits are declared assumptions and may be revised. `escalate` and
+  `no_retry` have no entry rather than an entry of `0`, because "no attempt was
+  made" and "an attempt was made and never succeeds" are different statements —
+  the same distinction the `NULL`-versus-`0` confidence rule preserves elsewhere.
+  Both always resolve to `escalated_pending`, which a test asserts across 1000
+  calls each.
+
+  Recovery outcomes are simulated (no real gateway execution) using the
+  category-appropriate probabilities above, chosen as reasoned estimates,
+  not measured real-world rates. The naive baseline (20%) is deliberately
+  lower than the ~30% naive-retry recovery rate cited in the PRD, because
+  this baseline blindly retries every category including hard_decline —
+  failures this system would never retry at all — while the PRD's cited
+  figure describes retriable failures more broadly. The gap between the
+  two numbers reflects category-aware routing avoiding wasted retries on
+  structurally-dead declines, not an inconsistency.
+
+  Every batch run stores its `rng_seed` (NOT NULL, on `batch_runs`), so any
+  reported rupee figure can be regenerated exactly. A determinism test asserts
+  that two runs with one seed agree at every position, not merely in aggregate.
+  This is a scope boundary rather than a placeholder: the day something here
+  calls a real gateway, these probabilities must be deleted rather than kept
+  beside it, because a mixture of measured and invented outcomes in one table is
+  worse than either alone.
+
 ## Known test-fidelity limitations
 
 - **`TestDedupeConcurrentSameEventID` is probabilistic.** It was validated by
