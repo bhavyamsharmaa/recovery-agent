@@ -81,10 +81,10 @@ type Summary struct {
 }
 
 // ListFilter narrows the payment list. An empty field means "no filter on this
-// column", which is why the SQL compares against '' rather than assembling the
-// WHERE clause by string concatenation: the filter values arrive from a URL
-// query string, and a query built by concatenation is one refactor away from
-// being injectable.
+// column", which the SQL expresses by comparing the parameter against an empty
+// string rather than by assembling the WHERE clause through concatenation: the
+// filter values arrive from a URL query string, and a query built by
+// concatenation is one refactor away from being injectable.
 type ListFilter struct {
 	Category string // matches failed_payments.category exactly
 	Action   string // matches the most recent decision's action exactly
