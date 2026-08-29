@@ -157,11 +157,50 @@ An agent that classifies failed payments and recovers them with policy-driven re
   is already the sort order precisely so that it can become one — is the change
   to make before it is not.
 
-- **Nothing writes the `outcomes` table, so the dashboard cannot show one.**
-  Both `cmd/trace-payment` and the detail view say "no outcome recorded yet"
-  rather than inventing a status, which is honest but does mean no part of the
-  system yet learns whether a decision actually recovered the payment. The read
-  path is built and waiting on both sides.
+- **`outcomes` is written only by `cmd/run-batch`, never by live webhook
+  traffic.** The table had no writer at all until batch runs arrived; it now has
+  exactly one, and it is the simulated one. A payment that reaches the system
+  through a real webhook still gets a decision and no outcome, so
+  `cmd/trace-payment` and the detail view continue to say "no outcome recorded
+  yet" for it — correctly, because nothing has confirmed what happened to it.
+  Only payments generated inside a batch run carry an outcome row, and every one
+  of those is a seeded coin flip rather than an observation. The consequence
+  worth stating plainly: this system still does not learn from production
+  traffic. It can only score a policy against a simulation of one.
+
+  Outcome rows carry `decision_id`, not just `payment_id`, so an outcome is
+  attached to the specific decision it followed rather than to the payment as a
+  whole — a payment with three decisions would otherwise have an outcome nobody
+  could attribute.
+
+- **A batch run's ids are deliberately NOT derived from its seed.** The scenario
+  mix, the amounts and the outcome draws all come from `--seed`, which is what
+  makes the rupee figures reproducible. The payment and event ids come from the
+  clock instead. Seeding them too would look more reproducible and would be
+  worse: a rerun would replay the same payment ids into a database that still
+  remembers them, so attempt counts would climb, the stopping rule would fire on
+  payments that had budget the first time, and the second run would be measuring
+  a different system than the first.
+
+  Each payment's outcome draw is derived from `(seed, stream, index)` rather
+  than taken from one shared stream, because `escalate` and `no_retry` consume
+  no draw. With a shared stream, one payment receiving a different action
+  between runs would shift every subsequent draw and the two runs would diverge
+  entirely; deriving per payment confines the difference to the payment it
+  happened to.
+
+  **This was observed, not merely anticipated.** Two runs at seed 20260829
+  produced identical stored figures to six decimal places — `at_risk=248121600`,
+  `recovered=81544300`, `rate=0.328647`, `baseline_rate=0.240844` — while their
+  outcome mixes differed by one payment (33/33 versus 32/34 still_failed /
+  escalated_pending). That is the documented residual variance of the decision
+  layer at `temperature: 0` showing up in a batch: one payment was routed
+  differently, and because the draws are per payment, nothing downstream of it
+  moved. The money totals matched because that payment was not recovered under
+  either action. **A same-seed rerun is therefore reproducible in its inputs and
+  its scoring, but not perfectly reproducible in its decisions** — the seed
+  pins everything this project controls, and the model is not one of those
+  things.
 
 - **Recovery outcomes are simulated — no gateway is ever called.** `internal/simulate`
   decides whether a decision "recovered" a payment with a seeded coin flip
