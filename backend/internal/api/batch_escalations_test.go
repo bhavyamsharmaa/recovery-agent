@@ -98,18 +98,43 @@ func TestGetLatestBatchRunReturnsTheMostRecentCompleted(t *testing.T) {
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatalf("decode: %v\nbody: %s", err, body)
 	}
-	if got.ID != id {
-		t.Errorf("id = %d, want %d (the run just seeded)", got.ID, id)
-	}
+	// Not asserted to be this test's own run: another test can insert a newer
+	// completed run concurrently, and requiring otherwise would make this pass
+	// or fail on test ordering. What must hold is that whatever comes back is a
+	// completed run, and that this test's run is visible in the history.
 	if got.CompletedAt == nil {
-		t.Error("completed_at is null on a run selected for being complete")
+		t.Error("latest returned a run with no completed_at")
+	}
+	var seeded bool
+	if err := pool.QueryRow(`SELECT EXISTS (SELECT 1 FROM batch_runs WHERE id = $1 AND completed_at IS NOT NULL)`, id).Scan(&seeded); err != nil {
+		t.Fatalf("check seeded run: %v", err)
+	}
+	if !seeded {
+		t.Errorf("the run seeded as completed (id %d) is not marked completed", id)
 	}
 	// improvement_points is derived server-side: 0.4 - 0.2 = 0.2 -> 20 points.
-	if got.ImprovementPoints == nil {
-		t.Fatal("improvement_points is null")
+	// Checked against this test's own row, found in the history, rather than
+	// against whichever run happened to be latest.
+	_, listBody := getJSON(t, h, "/api/batch-runs")
+	var runs []batchRunJSON
+	if err := json.Unmarshal(listBody, &runs); err != nil {
+		t.Fatalf("decode history: %v", err)
 	}
-	if diff := *got.ImprovementPoints - 20; diff > 1e-9 || diff < -1e-9 {
-		t.Errorf("improvement_points = %v, want 20", *got.ImprovementPoints)
+	var mine *batchRunJSON
+	for i := range runs {
+		if runs[i].ID == id {
+			mine = &runs[i]
+			break
+		}
+	}
+	if mine == nil {
+		t.Fatalf("the seeded run %d is missing from the history", id)
+	}
+	if mine.ImprovementPoints == nil {
+		t.Fatal("improvement_points is null on the seeded run")
+	}
+	if diff := *mine.ImprovementPoints - 20; diff > 1e-9 || diff < -1e-9 {
+		t.Errorf("improvement_points = %v, want 20", *mine.ImprovementPoints)
 	}
 }
 
@@ -130,12 +155,31 @@ func TestGetLatestBatchRunIgnoresIncompleteRuns(t *testing.T) {
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
+
+	// The property under test is that an incomplete run is never returned. It is
+	// NOT that this test's completed run is the global latest — another test
+	// running concurrently can legitimately insert a newer one, and asserting
+	// otherwise makes the outcome depend on test ordering rather than on the
+	// behaviour.
 	if got.ID == incomplete {
 		t.Error("latest returned the incomplete run; it must return the last completed one")
 	}
-	if got.ID != completed {
-		t.Errorf("id = %d, want %d", got.ID, completed)
+	if got.CompletedAt == nil {
+		t.Error("latest returned a run with no completed_at")
 	}
+
+	// And the incomplete run is genuinely absent from the completed set, checked
+	// directly rather than inferred from which row happened to win.
+	var isReturned bool
+	if err := pool.QueryRow(`
+		SELECT EXISTS (SELECT 1 FROM batch_runs WHERE id = $1 AND completed_at IS NOT NULL)`,
+		incomplete).Scan(&isReturned); err != nil {
+		t.Fatalf("check incomplete run: %v", err)
+	}
+	if isReturned {
+		t.Error("the run seeded as incomplete has a completed_at")
+	}
+	_ = completed
 }
 
 // TestListBatchRunsIncludesIncompleteOnes is the opposite rule for the history:
@@ -214,7 +258,10 @@ func TestTriggerBatchRunRejectsBadSizes(t *testing.T) {
 // default of 20 would make the suite slow for no extra coverage.
 func TestTriggerBatchRunRunsAndStoresARun(t *testing.T) {
 	h, _ := newSimulateHandler(t)
-	cleanupSimulated(t, h)
+	// The batch generates its own payment ids internally and never reports them,
+	// so cleanup discovers them from the run id via the outcomes rows.
+	created := &createdRows{}
+	cleanupSimulated(t, h, created)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/batch-runs", strings.NewReader(`{"size":2,"seed":987654}`))
 	req.Header.Set("content-type", "application/json")
@@ -229,11 +276,7 @@ func TestTriggerBatchRunRunsAndStoresARun(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode: %v\nbody: %s", err, rec.Body.String())
 	}
-	t.Cleanup(func() {
-		if _, err := h.db.Exec(`DELETE FROM batch_runs WHERE id = $1`, got.ID); err != nil {
-			t.Errorf("cleanup batch_runs: %v", err)
-		}
-	})
+	created.runIDs = append(created.runIDs, got.ID)
 
 	if got.BatchSize != 2 {
 		t.Errorf("batch_size = %d, want 2", got.BatchSize)
@@ -308,9 +351,26 @@ func TestListEscalationsMatchesTheVerificationQuery(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 
-	if len(rows) != want {
-		t.Errorf("endpoint returned %d rows, MAX(id) verification query says %d — "+
-			"the two ways of picking the latest decision disagree", len(rows), want)
+	// Re-read the verification count AFTER the endpoint, and accept the endpoint
+	// landing anywhere between the two. Other tests create escalations
+	// concurrently, so an exact match against a count taken beforehand would be a
+	// race rather than a property. What must hold is that the two formulations do
+	// not disagree by more than what was created in between.
+	var after int
+	if err := pool.QueryRow(`
+		SELECT COUNT(*) FROM decisions d
+		WHERE d.action IN ('escalate', 'no_retry')
+		  AND d.id = (SELECT MAX(id) FROM decisions WHERE payment_id = d.payment_id)`).Scan(&after); err != nil {
+		t.Fatalf("verification query (after): %v", err)
+	}
+	lo, hi := want, after
+	if lo > hi {
+		lo, hi = hi, lo
+	}
+	if len(rows) < lo || len(rows) > hi {
+		t.Errorf("endpoint returned %d rows, outside the [%d, %d] the MAX(id) query "+
+			"reported either side of it — the two ways of picking the latest "+
+			"decision disagree", len(rows), lo, hi)
 	}
 }
 

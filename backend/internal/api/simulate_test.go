@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -44,7 +45,9 @@ func newSimulateHandler(t *testing.T) (*Handler, *countingDecider) {
 	return NewHandler(pool).WithWebhook(webhook), decider
 }
 
-func postJSON(t *testing.T, h *Handler, target string) (*httptest.ResponseRecorder, map[string]any) {
+// postJSON posts and records every id in the response, so cleanup can delete
+// exactly what the call created.
+func postJSON(t *testing.T, h *Handler, target string, created *createdRows) (*httptest.ResponseRecorder, map[string]any) {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, target, strings.NewReader("{}"))
 	req.Header.Set("content-type", "application/json")
@@ -70,12 +73,13 @@ func decisionOf(t *testing.T, body map[string]any) map[string]any {
 
 func TestSimulateFailureRunsTheRealPipeline(t *testing.T) {
 	h, decider := newSimulateHandler(t)
-	cleanupSimulated(t, h)
+	created := &createdRows{}
+	cleanupSimulated(t, h, created)
 
 	for _, category := range []string{"insufficient_funds", "soft_decline", "network_error"} {
 		t.Run(category, func(t *testing.T) {
 			before := decider.calls
-			rec, body := postJSON(t, h, "/api/simulate/failure?category="+category)
+			rec, body := postJSON(t, h, "/api/simulate/failure?category="+category, created)
 
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status = %d, want 200; body: %v", rec.Code, body)
@@ -104,9 +108,10 @@ func TestSimulateFailureRunsTheRealPipeline(t *testing.T) {
 // not be reachable here even though it exists in the scenario table.
 func TestSimulateFailureRejectsUnknownCategory(t *testing.T) {
 	h, _ := newSimulateHandler(t)
+	// Nothing is created: every call is rejected before the pipeline runs.
 
 	for _, c := range []string{"", "not_a_category", "duplicate"} {
-		rec, body := postJSON(t, h, "/api/simulate/failure?category="+c)
+		rec, body := postJSON(t, h, "/api/simulate/failure?category="+c, nil)
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("category %q: status = %d, want 400 (body %v)", c, rec.Code, body)
 		}
@@ -118,9 +123,10 @@ func TestSimulateFailureRejectsUnknownCategory(t *testing.T) {
 // distinction has to come from observed state.
 func TestSimulateDuplicateShowsOneProcessedAndOneDuplicate(t *testing.T) {
 	h, _ := newSimulateHandler(t)
-	cleanupSimulated(t, h)
+	created := &createdRows{}
+	cleanupSimulated(t, h, created)
 
-	rec, body := postJSON(t, h, "/api/simulate/duplicate")
+	rec, body := postJSON(t, h, "/api/simulate/duplicate", created)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body: %v", rec.Code, body)
 	}
@@ -163,10 +169,11 @@ func TestSimulateDuplicateShowsOneProcessedAndOneDuplicate(t *testing.T) {
 // TestSimulateLLMFailureProducesTheFallback covers the demo path end to end.
 func TestSimulateLLMFailureProducesTheFallback(t *testing.T) {
 	h, decider := newSimulateHandler(t)
-	cleanupSimulated(t, h)
+	created := &createdRows{}
+	cleanupSimulated(t, h, created)
 
 	before := decider.calls
-	rec, body := postJSON(t, h, "/api/simulate/llm-failure")
+	rec, body := postJSON(t, h, "/api/simulate/llm-failure", created)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body: %v", rec.Code, body)
 	}
@@ -207,16 +214,17 @@ func TestSimulateLLMFailureProducesTheFallback(t *testing.T) {
 // exactly the Day 4 hazard in a subtler form.
 func TestSimulateEndpointsDoNotLeakTheForcedFailure(t *testing.T) {
 	h, decider := newSimulateHandler(t)
-	cleanupSimulated(t, h)
+	created := &createdRows{}
+	cleanupSimulated(t, h, created)
 
 	// Force one failure.
-	if rec, body := postJSON(t, h, "/api/simulate/llm-failure"); rec.Code != http.StatusOK {
+	if rec, body := postJSON(t, h, "/api/simulate/llm-failure", created); rec.Code != http.StatusOK {
 		t.Fatalf("forced failure did not succeed: %v", body)
 	}
 
 	// Then an ordinary simulated failure through the same handler.
 	before := decider.calls
-	rec, body := postJSON(t, h, "/api/simulate/failure?category=insufficient_funds")
+	rec, body := postJSON(t, h, "/api/simulate/failure?category=insufficient_funds", created)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body: %v", rec.Code, body)
 	}
@@ -236,20 +244,29 @@ func TestSimulateEndpointsDoNotLeakTheForcedFailure(t *testing.T) {
 // path must never pick up the marker.
 func TestWebhookThroughAPIHandlerIsNeverForced(t *testing.T) {
 	h, decider := newSimulateHandler(t)
-	cleanupSimulated(t, h)
+	created := &createdRows{}
+	cleanupSimulated(t, h, created)
 
 	// Force a failure first, so any shared state would be contaminated.
-	postJSON(t, h, "/api/simulate/llm-failure")
+	postJSON(t, h, "/api/simulate/llm-failure", created)
 
 	before := decider.calls
+	// Unique per run and registered for cleanup. Fixed ids would survive in
+	// webhook_events — dedupe is persistent — and every later run would be
+	// answered as a duplicate without ever reaching the decider.
+	paymentID := fmt.Sprintf("pay_api_isolation_probe_%d", time.Now().UnixNano())
+	eventID := fmt.Sprintf("evt_api_isolation_probe_%d", time.Now().UnixNano())
+	created.payment(paymentID)
+	created.event(eventID)
+
 	body := `{"event":"payment.failed","payload":{"payment":{"entity":{` +
-		`"id":"pay_api_isolation_probe","amount":50000,"method":"card",` +
+		`"id":"` + paymentID + `","amount":50000,"method":"card",` +
 		`"error_code":"BAD_REQUEST_ERROR","error_reason":"insufficient_funds",` +
 		`"error_source":"customer","error_step":"payment_authorization"}}}}`
 
 	req := httptest.NewRequest(http.MethodPost, "/webhook/payment-failed", strings.NewReader(body))
 	req.Header.Set("content-type", "application/json")
-	req.Header.Set("x-razorpay-event-id", "evt_api_isolation_probe")
+	req.Header.Set("x-razorpay-event-id", eventID)
 	rec := httptest.NewRecorder()
 	h.webhook.ServeHTTP(rec, req)
 
@@ -278,28 +295,106 @@ func (d *countingDecider) Decide(ctx context.Context, in decide.DecisionInput) (
 	}, decide.Outcome{}, nil
 }
 
-// cleanupSimulated removes every row a simulate test created. The endpoints
-// generate their own random ids, so the sweep is by shape rather than by a list
-// of ids the test kept: anything created during the test window that these
-// endpoints could have made.
-func cleanupSimulated(t *testing.T, h *Handler) {
+// createdRows collects the ids one test created, so cleanup can delete exactly
+// those and nothing else.
+//
+// The endpoints under test generate their own random ids internally, so the test
+// cannot know them in advance — it records them from the responses instead.
+type createdRows struct {
+	paymentIDs []string
+	eventIDs   []string
+	runIDs     []int64
+}
+
+func (c *createdRows) payment(id string) {
+	if id != "" {
+		c.paymentIDs = append(c.paymentIDs, id)
+	}
+}
+
+func (c *createdRows) event(id string) {
+	if id != "" {
+		c.eventIDs = append(c.eventIDs, id)
+	}
+}
+
+// track records every id present in a simulate endpoint's response body.
+func (c *createdRows) track(body map[string]any) {
+	if d, ok := body["decision"].(map[string]any); ok {
+		if id, ok := d["payment_id"].(string); ok {
+			c.payment(id)
+		}
+	}
+	if id, ok := body["event_id"].(string); ok {
+		c.event(id)
+	}
+	if id, ok := body["id"].(float64); ok {
+		c.runIDs = append(c.runIDs, int64(id))
+	}
+}
+
+// cleanupSimulated removes exactly the rows a test created, by id.
+//
+// It used to delete by timestamp window — anything created since the test
+// started. That is wrong in a way that only shows up under load: `go test ./...`
+// runs packages in parallel, so one package's cleanup would delete another
+// package's live rows mid-test, and the victim varied from run to run. It broke
+// TestDecisionsAccumulatePerAttempt and TestDecisionPersistedFromStoppingRule in
+// internal/ingest, neither of which this package should be able to touch.
+//
+// The same reasoning already applies to the queries this project writes for
+// production: a timestamp window is not an identifier, and anything that shares
+// the window is collateral. Scoping by id is what every other test helper here
+// already does.
+//
+// A run also writes rows this list cannot name — a batch triggered through the
+// API creates its own payments internally. Those are collected from the
+// batch_runs id instead, via the outcomes that point at them.
+func cleanupSimulated(t *testing.T, h *Handler, created *createdRows) {
 	t.Helper()
-	start := time.Now().UTC().Add(-time.Second)
 	t.Cleanup(func() {
+		// A batch run's payments are discovered through its outcomes rows, since
+		// the batch generated the ids itself and never reported them.
+		for _, runID := range created.runIDs {
+			rows, err := h.db.Query(`
+				SELECT DISTINCT o.payment_id
+				FROM outcomes o
+				JOIN batch_runs b ON b.id = $1
+				WHERE o.recorded_at BETWEEN b.started_at AND COALESCE(b.completed_at, now())`, runID)
+			if err != nil {
+				t.Errorf("collect batch payments: %v", err)
+				continue
+			}
+			for rows.Next() {
+				var id string
+				if err := rows.Scan(&id); err == nil {
+					created.payment(id)
+				}
+			}
+			rows.Close()
+		}
+
 		// Children first: the schema deliberately has no ON DELETE CASCADE.
-		if _, err := h.db.Exec(
-			`DELETE FROM outcomes WHERE payment_id IN (SELECT payment_id FROM failed_payments WHERE created_at >= $1)`, start); err != nil {
-			t.Errorf("cleanup outcomes: %v", err)
+		if len(created.paymentIDs) > 0 {
+			if _, err := h.db.Exec(`DELETE FROM outcomes WHERE payment_id = ANY($1)`, created.paymentIDs); err != nil {
+				t.Errorf("cleanup outcomes: %v", err)
+			}
+			if _, err := h.db.Exec(`DELETE FROM decisions WHERE payment_id = ANY($1)`, created.paymentIDs); err != nil {
+				t.Errorf("cleanup decisions: %v", err)
+			}
+			if _, err := h.db.Exec(`DELETE FROM failed_payments WHERE payment_id = ANY($1)`, created.paymentIDs); err != nil {
+				t.Errorf("cleanup failed_payments: %v", err)
+			}
 		}
-		if _, err := h.db.Exec(
-			`DELETE FROM decisions WHERE payment_id IN (SELECT payment_id FROM failed_payments WHERE created_at >= $1)`, start); err != nil {
-			t.Errorf("cleanup decisions: %v", err)
+		if len(created.eventIDs) > 0 {
+			if _, err := h.db.Exec(`DELETE FROM webhook_events WHERE event_id = ANY($1)`, created.eventIDs); err != nil {
+				t.Errorf("cleanup webhook_events: %v", err)
+			}
 		}
-		if _, err := h.db.Exec(`DELETE FROM webhook_events WHERE received_at >= $1`, start); err != nil {
-			t.Errorf("cleanup webhook_events: %v", err)
-		}
-		if _, err := h.db.Exec(`DELETE FROM failed_payments WHERE created_at >= $1`, start); err != nil {
-			t.Errorf("cleanup failed_payments: %v", err)
+		for _, runID := range created.runIDs {
+			if _, err := h.db.Exec(`DELETE FROM batch_runs WHERE id = $1`, runID); err != nil {
+				t.Errorf("cleanup batch_runs: %v", err)
+			}
 		}
 	})
 }
