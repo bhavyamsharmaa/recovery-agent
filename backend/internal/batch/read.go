@@ -34,18 +34,23 @@ type StoredRun struct {
 	RecoveryRate           sql.NullFloat64
 	BaselineRecoveredPaise sql.NullInt64
 	BaselineRecoveryRate   sql.NullFloat64
+
+	// FallbackDecisions is NULL for a run that never completed, and 0 for a run
+	// that completed with every payment reaching the model. Those are different
+	// statements and stay distinguishable.
+	FallbackDecisions sql.NullInt64
 }
 
 const runColumns = `
 	id, started_at, completed_at, batch_size, rng_seed,
 	total_at_risk_paise, total_recovered_paise, recovery_rate,
-	baseline_recovered_paise, baseline_recovery_rate`
+	baseline_recovered_paise, baseline_recovery_rate, fallback_decisions`
 
 func scanRun(s interface{ Scan(...any) error }) (StoredRun, error) {
 	var r StoredRun
 	err := s.Scan(&r.ID, &r.StartedAt, &r.CompletedAt, &r.BatchSize, &r.RNGSeed,
 		&r.TotalAtRiskPaise, &r.TotalRecoveredPaise, &r.RecoveryRate,
-		&r.BaselineRecoveredPaise, &r.BaselineRecoveryRate)
+		&r.BaselineRecoveredPaise, &r.BaselineRecoveryRate, &r.FallbackDecisions)
 	return r, err
 }
 

@@ -183,6 +183,8 @@ export function Figures({ run }: { run: BatchRun }) {
         baseline={run.baseline_recovered_paise}
       />
 
+      <DegradedRunNotice count={run.fallback_decisions} size={run.batch_size} />
+
       <p className="text-xs text-slate-500">
         Run #{run.id} {'·'} seed <span className="font-mono">{run.rng_seed}</span> {'·'}{' '}
         {run.completed_at === null ? 'not completed' : timestamp(run.completed_at)}
@@ -284,6 +286,42 @@ function Improvement({
         <span className="font-medium tabular-nums">{rupees(Math.abs(delta))}</span>
       </p>
     </div>
+  )
+}
+
+/**
+ * DegradedRunNotice explains a recovery rate that was depressed by the model
+ * being unreachable rather than by the routing.
+ *
+ * Shown only when the count is above zero. A clean run stays uncluttered, and a
+ * permanent "0 payments failed to reach the model" line would be noise that
+ * teaches a reader to stop reading it — which is exactly when it would matter.
+ *
+ * Null is not zero here. A run recorded before this count existed, or one that
+ * never completed, reports null, and claiming "every payment reached the model"
+ * on that basis would be an assertion nothing supports. Null renders nothing,
+ * same as zero, but for the opposite reason: not "there is nothing to say" but
+ * "there is nothing known to say".
+ *
+ * The wording names it as infrastructure rather than policy, because the two
+ * are genuinely different and the aggregate figures cannot tell them apart:
+ * these payments sit in escalated_pending exactly like a deliberate escalation
+ * does, contributing nothing recovered, against a baseline that never calls a
+ * model and is therefore unaffected by the same outage.
+ */
+function DegradedRunNotice({ count, size }: { count: number | null; size: number }) {
+  if (count === null || count <= 0) return null
+
+  return (
+    <p className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-900 ring-1 ring-inset ring-amber-600/20">
+      <strong className="font-semibold">
+        {count} of {size} payments couldn{"'"}t reach the model during this run
+      </strong>{' '}
+      (LLM infrastructure issue, not a policy decision) {'—'} those fell back to a conservative
+      no-retry decision, which never resolves, so the recovery rate above may be depressed as a
+      result. The naive baseline never calls a model and is unaffected, so the comparison
+      understates the agent.
+    </p>
   )
 }
 

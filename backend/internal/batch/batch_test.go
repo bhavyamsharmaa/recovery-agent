@@ -84,6 +84,7 @@ type stubWebhook struct {
 	seen       *[]string
 	amountFor  func(i int) int64
 	actionFor  func(i int) string
+	sourceFor  func(i int) string
 	statusFor  func(i int) int
 	skipRecord func(i int) bool
 	calls      int
@@ -124,6 +125,13 @@ func (s *stubWebhook) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	paymentID := payload.Payload.Payment.Entity.ID
 	*s.seen = append(*s.seen, paymentID)
 
+	// The decision source defaults to llm; a case that needs to model an outage
+	// supplies fallback_rule instead.
+	src := "llm"
+	if s.sourceFor != nil {
+		src = s.sourceFor(i)
+	}
+
 	amount := s.amountFor(i)
 	now := time.Now().UTC()
 	if _, err := s.pool.Exec(`
@@ -138,7 +146,7 @@ func (s *stubWebhook) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, err := s.pool.Exec(`
 		INSERT INTO decisions (payment_id, attempt_number, action, source, confidence)
-		VALUES ($1, 1, $2, 'llm', 0.9)`, paymentID, s.actionFor(i)); err != nil {
+		VALUES ($1, 1, $2, $3, 0.9)`, paymentID, s.actionFor(i), src); err != nil {
 		s.t.Errorf("stub insert decision: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -541,5 +549,99 @@ func TestDeriveIsStableAndSeparatesStreams(t *testing.T) {
 	// A different batch seed must move every stream.
 	if derive(seed, "outcome", 7) == derive(seed+1, "outcome", 7) {
 		t.Error("changing the batch seed did not change the derived value")
+	}
+}
+
+// TestRunCountsFallbackDecisionsBySource covers the count that qualifies the
+// headline figures.
+//
+// The distinction is not cosmetic. A payment whose decision came from the
+// fallback never reached the model at all, so it contributes nothing recovered
+// while the baseline — which never calls a model — is unaffected by the same
+// outage. During an Anthropic 529 period a 100-payment run scored +1.7pp with
+// 11 such payments and nothing on screen explaining it.
+//
+// The count must key on decisions.source, not on the action: no_retry is also a
+// legitimate model answer, and counting by action would fold genuine decisions
+// in with failures to decide.
+func TestRunCountsFallbackDecisionsBySource(t *testing.T) {
+	pool := liveDB(t)
+	var seen []string
+
+	// Index 2 is a genuine model no_retry — the trap. Indexes 1 and 3 are real
+	// fallbacks. A source-based count says 2; an action-based one would say 3.
+	stub := &stubWebhook{
+		t: t, pool: pool, seen: &seen,
+		amountFor: func(int) int64 { return 100000 },
+		actionFor: func(i int) string {
+			if i == 2 {
+				return "no_retry"
+			}
+			return "retry_now"
+		},
+		sourceFor: func(i int) string {
+			if i == 1 || i == 3 {
+				return "fallback_rule"
+			}
+			return "llm"
+		},
+	}
+	srv := httptest.NewServer(stub)
+	defer srv.Close()
+
+	res, err := Run(context.Background(), pool, Options{Size: 5, Seed: 313131, URL: srv.URL})
+	cleanupRun(t, pool, res.ID, &seen)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if res.FallbackDecisions != 2 {
+		t.Errorf("FallbackDecisions = %d, want 2 — the genuine model no_retry at index 2 "+
+			"must not be counted as a failure to decide", res.FallbackDecisions)
+	}
+
+	// And it must reach the row, not just the in-memory Result: the dashboard
+	// reads the row.
+	stored := readRun(t, pool, res.ID)
+	if !stored.FallbackDecisions.Valid {
+		t.Fatal("fallback_decisions is NULL on a completed run")
+	}
+	if stored.FallbackDecisions.Int64 != 2 {
+		t.Errorf("stored fallback_decisions = %d, want 2", stored.FallbackDecisions.Int64)
+	}
+}
+
+// TestRunStoresZeroFallbacksOnACleanRun pins the other half: 0 is a real,
+// computed answer and must be stored as such. A NULL would be indistinguishable
+// from a run recorded before this count existed, and the dashboard would then
+// have no way to tell "every payment reached the model" from "nobody knows".
+func TestRunStoresZeroFallbacksOnACleanRun(t *testing.T) {
+	pool := liveDB(t)
+	var seen []string
+
+	stub := &stubWebhook{
+		t: t, pool: pool, seen: &seen,
+		amountFor: func(int) int64 { return 50000 },
+		actionFor: func(int) string { return "retry_now" },
+	}
+	srv := httptest.NewServer(stub)
+	defer srv.Close()
+
+	res, err := Run(context.Background(), pool, Options{Size: 3, Seed: 141414, URL: srv.URL})
+	cleanupRun(t, pool, res.ID, &seen)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if res.FallbackDecisions != 0 {
+		t.Errorf("FallbackDecisions = %d, want 0", res.FallbackDecisions)
+	}
+	stored := readRun(t, pool, res.ID)
+	if !stored.FallbackDecisions.Valid {
+		t.Error("fallback_decisions is NULL on a clean completed run; 0 and NULL are " +
+			"different claims and the dashboard depends on telling them apart")
+	}
+	if stored.FallbackDecisions.Int64 != 0 {
+		t.Errorf("stored fallback_decisions = %d, want 0", stored.FallbackDecisions.Int64)
 	}
 }

@@ -1,0 +1,26 @@
+-- How many of a batch's payments never reached the model.
+--
+-- The decision layer's fallback fires when both the model call and its retry
+-- fail — an upstream outage, not a policy choice. Those payments get
+-- action=no_retry from source=fallback_rule, which never auto-resolves, so they
+-- land in escalated_pending and contribute nothing to the recovered total.
+--
+-- Without this column the batch summary reports one escalated_pending figure
+-- covering two different things: payments the agent decided not to retry, and
+-- payments it could not form a decision about at all. During an Anthropic 529
+-- period a run scored +1.7pp against a baseline that never calls a model, with
+-- 11 of 100 payments in the second category and nothing on screen saying so.
+-- That is the same conflation this schema refuses elsewhere — NULL confidence
+-- against 0, a missing outcome against a failed one — and it belongs on the row
+-- rather than being re-derived by each reader.
+--
+-- Counted at write time from decisions.source, not inferred later. There is no
+-- foreign key from outcomes to batch_runs, so a reader trying to reconstruct
+-- this after the fact can only guess by timestamp window, which any concurrent
+-- traffic invalidates.
+--
+-- Nullable, like the other result columns: it is unknown until the run
+-- completes, and a run that crashed should say "unknown" rather than "zero".
+-- Zero and NULL are different claims here too.
+ALTER TABLE batch_runs
+    ADD COLUMN IF NOT EXISTS fallback_decisions INT;

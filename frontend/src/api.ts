@@ -109,6 +109,16 @@ export interface BatchRun {
   baseline_recovery_rate: number | null
 
   /**
+   * Payments in this run whose decision came from the fallback — the model call
+   * and its retry both failed, so no decision was formed at all.
+   *
+   * Null means the run predates this being recorded, or never completed; 0 is a
+   * real answer meaning every payment reached the model. The two must not be
+   * collapsed: null cannot be reported as a clean run.
+   */
+  fallback_decisions: number | null
+
+  /**
    * recovery_rate - baseline_recovery_rate, already in percentage points.
    *
    * Computed by the backend rather than here on purpose: it is the headline

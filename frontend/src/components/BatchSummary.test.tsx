@@ -27,6 +27,7 @@ function run(overrides: Partial<BatchRun> = {}): BatchRun {
     baseline_recovered_paise: 10705400, // ₹1,07,054.00
     baseline_recovery_rate: 0.2313180639585134, // 23.1%
     improvement_points: 14.081676750216076, // +14.1
+    fallback_decisions: 0, // clean run: every payment reached the model
     ...overrides,
   }
 }
@@ -139,5 +140,60 @@ describe('Figures — an incomplete run', () => {
     )
     expect(screen.getByText(/never completed/)).toBeDefined()
     expect(screen.queryByText('0.0%')).toBeNull()
+  })
+})
+
+describe('Figures — the degraded-run notice', () => {
+  // The distinction this exists for: escalated_pending merges "the agent chose
+  // not to retry" with "the agent could not form a decision". The aggregate
+  // figures cannot tell them apart, so the notice says which happened.
+  it('appears when payments could not reach the model, naming it as infrastructure', () => {
+    // Run 48's real conditions: 11 of 100 hit the fallback during an Anthropic
+    // 529 period, dragging the agent to +1.7pp against a baseline that never
+    // calls a model at all.
+    render(
+      <Figures
+        run={run({
+          batch_size: 100,
+          fallback_decisions: 11,
+          total_at_risk_paise: 256621300,
+          total_recovered_paise: 56395300,
+          recovery_rate: 0.21976079148535216,
+          baseline_recovered_paise: 51943600,
+          baseline_recovery_rate: 0.20241343957029287,
+          improvement_points: 1.734735191505929,
+        })}
+      />,
+    )
+
+    expect(screen.getByText(/11 of 100 payments couldn't reach the model/)).toBeDefined()
+    // It must say this was infrastructure, not a decision the agent made.
+    expect(screen.getByText(/LLM infrastructure issue, not a policy decision/)).toBeDefined()
+    // And the headline figures are still shown rather than suppressed.
+    expect(screen.getByText('22.0%')).toBeDefined()
+    expect(screen.getByText('20.2%')).toBeDefined()
+    expect(screen.getByText('+1.7 percentage points')).toBeDefined()
+  })
+
+  it('stays absent on a clean run', () => {
+    render(<Figures run={run({ fallback_decisions: 0 })} />)
+    // A permanent "0 payments failed" line would be noise that teaches a reader
+    // to stop reading it — exactly when it would matter.
+    expect(screen.queryByText(/couldn't reach the model/)).toBeNull()
+    expect(screen.queryByText(/LLM infrastructure issue/)).toBeNull()
+  })
+
+  it('stays absent when the count is unknown, rather than claiming a clean run', () => {
+    // Null means the run predates this being recorded, or never completed.
+    // Rendering nothing is right; rendering "0 payments failed" would assert
+    // something nothing supports.
+    render(<Figures run={run({ fallback_decisions: null })} />)
+    expect(screen.queryByText(/couldn't reach the model/)).toBeNull()
+    expect(screen.queryByText(/0 of/)).toBeNull()
+  })
+
+  it('appears even for a single affected payment', () => {
+    render(<Figures run={run({ batch_size: 100, fallback_decisions: 1 })} />)
+    expect(screen.getByText(/1 of 100 payments couldn't reach the model/)).toBeDefined()
   })
 })

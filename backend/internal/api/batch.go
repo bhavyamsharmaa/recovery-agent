@@ -77,6 +77,14 @@ type batchRunJSON struct {
 	BaselineRecoveredPaise *int64   `json:"baseline_recovered_paise"`
 	BaselineRecoveryRate   *float64 `json:"baseline_recovery_rate"`
 
+	// FallbackDecisions counts payments in this run whose decision came from the
+	// fallback — the model call and its retry both failed, so no decision was
+	// formed at all. Those payments never auto-resolve, so they depress the
+	// recovery rate for a reason that is an infrastructure outage rather than a
+	// policy choice. Null when the run never completed; 0 is a real answer
+	// meaning every payment reached the model.
+	FallbackDecisions *int `json:"fallback_decisions"`
+
 	// ImprovementPoints is recovery_rate - baseline_recovery_rate, in percentage
 	// points, computed here rather than in the browser. It is the headline
 	// number of the whole feature, and two clients deriving it independently is
@@ -95,6 +103,7 @@ func toBatchRunJSON(r batch.StoredRun) batchRunJSON {
 		RecoveryRate:           nullFloat(r.RecoveryRate),
 		BaselineRecoveredPaise: nullInt(r.BaselineRecoveredPaise),
 		BaselineRecoveryRate:   nullFloat(r.BaselineRecoveryRate),
+		FallbackDecisions:      nullIntAsInt(r.FallbackDecisions),
 	}
 	if r.CompletedAt.Valid {
 		t := jsonTime(r.CompletedAt.Time)
@@ -221,10 +230,21 @@ func (h *Handler) triggerBatchRun(w http.ResponseWriter, r *http.Request) {
 			RecoveryRate:           &res.RecoveryRate,
 			BaselineRecoveredPaise: &res.BaselineRecoveredPaise,
 			BaselineRecoveryRate:   &res.BaselineRecoveryRate,
+			FallbackDecisions:      &res.FallbackDecisions,
 		})
 		return
 	}
 	writeJSON(w, http.StatusOK, toBatchRunJSON(run))
+}
+
+// nullIntAsInt narrows a nullable BIGINT to *int for counts, which are small
+// and read more naturally as int in JSON consumers.
+func nullIntAsInt(n sql.NullInt64) *int {
+	if !n.Valid {
+		return nil
+	}
+	v := int(n.Int64)
+	return &v
 }
 
 // nullInt mirrors nullString and nullFloat in api.go: a NULL column becomes a

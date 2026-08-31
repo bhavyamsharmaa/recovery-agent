@@ -36,6 +36,7 @@ import (
 	"math/rand"
 	"time"
 
+	"github.com/bhavyamsharmaa/recovery-agent/internal/ingest"
 	"github.com/bhavyamsharmaa/recovery-agent/internal/simulate"
 	"github.com/bhavyamsharmaa/recovery-agent/internal/trace"
 )
@@ -81,6 +82,18 @@ type Result struct {
 	StillFailed      int
 	EscalatedPending int
 	Skipped          int
+
+	// FallbackDecisions counts payments whose decision came from the fallback —
+	// both the model call and its retry failed, so no decision was ever formed.
+	//
+	// This one IS stored on batch_runs, unlike the counts above, because it
+	// qualifies the headline figures rather than merely describing them. Those
+	// payments never auto-resolve, so they sit in EscalatedPending contributing
+	// nothing recovered, and a reader comparing the agent against a baseline
+	// that never calls a model deserves to know how many of them there were.
+	// Deriving it afterwards is not possible: nothing links an outcome row back
+	// to the run that wrote it.
+	FallbackDecisions int
 }
 
 // Run executes a batch and returns its summary.
@@ -194,6 +207,13 @@ func Run(ctx context.Context, pool *sql.DB, opts Options) (Result, error) {
 		case simulate.OutcomeEscalatedPending:
 			res.EscalatedPending++
 		}
+
+		// Read from the decision's own source rather than inferred from the
+		// action: no_retry is also a legitimate model answer, so counting by
+		// action would fold genuine decisions in with failures to decide.
+		if decision.Source == ingest.DecisionSourceFallbackRule {
+			res.FallbackDecisions++
+		}
 		// The baseline is accumulated only. It is not written to outcomes,
 		// because that table is a record of what happened to real payments in
 		// this system, and the baseline is a strategy this system did not run.
@@ -299,10 +319,11 @@ func finishRun(ctx context.Context, pool *sql.DB, res Result) error {
 		    total_recovered_paise = $3,
 		    recovery_rate = $4,
 		    baseline_recovered_paise = $5,
-		    baseline_recovery_rate = $6
+		    baseline_recovery_rate = $6,
+		    fallback_decisions = $7
 		WHERE id = $1`,
 		res.ID, res.TotalAtRiskPaise, res.TotalRecoveredPaise, res.RecoveryRate,
-		res.BaselineRecoveredPaise, res.BaselineRecoveryRate); err != nil {
+		res.BaselineRecoveredPaise, res.BaselineRecoveryRate, res.FallbackDecisions); err != nil {
 		return fmt.Errorf("batch: finish run: %w", err)
 	}
 	return nil
