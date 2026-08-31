@@ -73,7 +73,16 @@ func main() {
 	// not new.
 	events := ingest.NewPostgresEventStore(pool)
 
-	handler := ingest.NewHandler(client, attempts).
+	// The decider is wrapped so that a request which explicitly asks for a
+	// forced decision failure gets one. Nothing arriving on the webhook endpoint
+	// can ask: the marker is a context value that only /api/simulate/llm-failure
+	// sets, and it replaces the FORCE_DECIDE_FAILURE environment variable that
+	// was removed before the Day 4 merge precisely because a global switch could
+	// be left on by accident. For every other request this wrapper is a
+	// pass-through to the real client.
+	decider := &ingest.ForcedFailureDecider{Real: client}
+
+	handler := ingest.NewHandler(decider, attempts).
 		WithDecisionRecorder(decisions).
 		WithEventStore(events)
 	http.Handle("/webhook/payment-failed", handler)
@@ -82,7 +91,10 @@ func main() {
 	// every /api/ route and to nothing else. The webhook above is called by
 	// Razorpay, not by a browser, and has no business advertising an allowed
 	// origin.
-	http.Handle("/api/", api.NewHandler(pool))
+	// The API is given the webhook handler so the demo control panel can fire
+	// real deliveries through the real pipeline in-process, rather than through
+	// a shortcut that would demonstrate nothing.
+	http.Handle("/api/", api.NewHandler(pool).WithWebhook(handler))
 
 	fmt.Println("server up")
 	if err := http.ListenAndServe(":8080", nil); err != nil {

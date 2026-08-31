@@ -54,9 +54,9 @@ type Decision struct {
 	CreatedAt        time.Time
 }
 
-// Outcome is one outcomes row. Nothing writes to that table yet, so this is
-// reliably empty today; it is read anyway because the day something does write
-// to it, every reader should already show it.
+// Outcome is one outcomes row. Written only by batch runs, never by live
+// webhook traffic, so a payment that arrived through a real webhook has none —
+// correctly, because nothing has confirmed what happened to it.
 type Outcome struct {
 	Outcome    string
 	DecisionID sql.NullInt64
@@ -235,6 +235,92 @@ func List(ctx context.Context, db *sql.DB, f ListFilter) ([]Summary, error) {
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("trace: iterate payments: %w", err)
+	}
+	return all, nil
+}
+
+// Escalation is one payment whose latest decision needs a human.
+//
+// It carries the reasoning and the customer message inline rather than making
+// the caller fetch them separately: the queue exists to answer "why does a
+// person need to look at this", and an answer that requires another round trip
+// is one a reviewer scanning a list will not read.
+type Escalation struct {
+	Payment
+
+	DecisionID       int64
+	AttemptNumber    int
+	Action           string
+	Source           string
+	Confidence       sql.NullFloat64
+	EscalationReason sql.NullString
+	OriginalAction   sql.NullString
+	Reasoning        sql.NullString
+	CustomerMessage  sql.NullString
+	DecidedAt        time.Time
+}
+
+// escalatedActions are the actions that end automated handling. A payment whose
+// latest decision is one of these is waiting on a person.
+//
+// no_retry is included alongside escalate because both stop the machine: the
+// difference is that escalate names a policy reason for stopping and no_retry
+// is what the fallback answers when the system could not reason at all. A queue
+// that showed only escalate would hide exactly the cases where the agent knew
+// least.
+var escalatedActions = []string{"escalate", "no_retry"}
+
+// Escalations reads every payment whose most recent decision stops automated
+// handling, most recent first.
+//
+// "Most recent decision" is resolved with DISTINCT ON for the same reason List
+// uses it: action, source, confidence and reasoning must all come from the same
+// winning row. A MAX(id) subquery filtered afterwards would work too, but it
+// invites a later edit that compares one column from the winning row against
+// another from a different one.
+//
+// Ordered by when the decision was made rather than when the payment was last
+// seen: this is a work queue, and what a reviewer wants at the top is the case
+// that most recently started needing them.
+func Escalations(ctx context.Context, db *sql.DB) ([]Escalation, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT p.payment_id, p.category, p.error_code, p.error_reason,
+		       p.error_source, p.payment_method, p.amount_paise, p.attempt_count,
+		       p.first_failed_at, p.last_seen_at,
+		       d.id, d.attempt_number, d.action, d.source, d.confidence,
+		       d.escalation_reason, d.original_action, d.reasoning,
+		       d.customer_message, d.created_at
+		FROM failed_payments p
+		JOIN (
+			SELECT DISTINCT ON (payment_id)
+			       id, payment_id, attempt_number, action, source, confidence,
+			       escalation_reason, original_action, reasoning, customer_message,
+			       created_at
+			FROM decisions
+			ORDER BY payment_id, attempt_number DESC, id DESC
+		) d ON d.payment_id = p.payment_id
+		WHERE d.action = ANY($1)
+		ORDER BY d.created_at DESC, d.id DESC`, escalatedActions)
+	if err != nil {
+		return nil, fmt.Errorf("trace: list escalations: %w", err)
+	}
+	defer rows.Close()
+
+	var all []Escalation
+	for rows.Next() {
+		var e Escalation
+		if err := rows.Scan(&e.PaymentID, &e.Category, &e.ErrorCode, &e.ErrorReason,
+			&e.ErrorSource, &e.PaymentMethod, &e.AmountPaise, &e.AttemptCount,
+			&e.FirstFailedAt, &e.LastSeenAt,
+			&e.DecisionID, &e.AttemptNumber, &e.Action, &e.Source, &e.Confidence,
+			&e.EscalationReason, &e.OriginalAction, &e.Reasoning,
+			&e.CustomerMessage, &e.DecidedAt); err != nil {
+			return nil, fmt.Errorf("trace: scan escalation: %w", err)
+		}
+		all = append(all, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("trace: iterate escalations: %w", err)
 	}
 	return all, nil
 }

@@ -42,6 +42,30 @@ type Handler struct {
 	db     *sql.DB
 	origin string
 	mux    *http.ServeMux
+
+	// batch serialises triggered batch runs. See batch.go: two at once would
+	// interleave through one attempt counter and produce figures that describe
+	// nothing reproducible.
+	batch batchRunner
+
+	// webhook is the real ingest handler, used by the /api/simulate/ routes to
+	// dispatch a delivery in-process. Nil unless WithWebhook is called, and the
+	// simulate routes report themselves unavailable rather than pretending when
+	// it is — a demo endpoint that silently did nothing would be worse than one
+	// that says it is not wired.
+	webhook http.Handler
+}
+
+// WithWebhook attaches the ingest handler so the demo control panel can fire
+// real deliveries through it.
+//
+// It is a separate call rather than a NewHandler parameter for the same reason
+// the ingest package uses this shape: every existing caller and test keeps the
+// constructor it already uses, and an API served without it is still a complete
+// read API.
+func (h *Handler) WithWebhook(webhook http.Handler) *Handler {
+	h.webhook = webhook
+	return h
 }
 
 // NewHandler builds the API handler and registers its routes.
@@ -59,6 +83,23 @@ func NewHandler(db *sql.DB) *Handler {
 	h := &Handler{db: db, origin: origin, mux: http.NewServeMux()}
 	h.mux.HandleFunc("GET /api/payments", h.listPayments)
 	h.mux.HandleFunc("GET /api/payments/{payment_id}", h.getPayment)
+
+	// The escalation queue: payments whose latest decision left them for a
+	// person, with the reasoning that put them there.
+	h.mux.HandleFunc("GET /api/escalations", h.listEscalations)
+
+	// The batch-run routes. The first two are reads like everything above; the
+	// POST is the one route on this surface that writes, and batch.go explains
+	// what guards it.
+	h.mux.HandleFunc("GET /api/batch-runs/latest", h.latestBatchRun)
+	h.mux.HandleFunc("GET /api/batch-runs", h.listBatchRuns)
+	h.mux.HandleFunc("POST /api/batch-runs", h.triggerBatchRun)
+
+	// The demo control panel. All three write, and the last one can make the
+	// decision layer fail — but only for its own request. See simulate.go.
+	h.mux.HandleFunc("POST /api/simulate/failure", h.simulateFailure)
+	h.mux.HandleFunc("POST /api/simulate/duplicate", h.simulateDuplicate)
+	h.mux.HandleFunc("POST /api/simulate/llm-failure", h.simulateLLMFailure)
 	return h
 }
 
@@ -70,7 +111,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// knows about GET and would answer a browser's OPTIONS with a 405 that the
 	// browser reports as an opaque CORS failure.
 	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		// POST is advertised because of the batch-run trigger. Without it a
+		// browser's preflight for that one route fails and the button appears
+		// broken for reasons nothing in the console explains.
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		w.WriteHeader(http.StatusNoContent)
 		return
