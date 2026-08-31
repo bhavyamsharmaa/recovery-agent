@@ -1,1 +1,26 @@
 @import "tailwindcss";
+
+@theme {
+  /* The width at which the payments feed switches between its card layout and
+     its table.
+
+     840px, not Tailwind's sm (640px) or md (768px), because it is derived from
+     the table rather than chosen from a scale.
+
+     The arithmetic: the six columns have a minimum content width of 781px, and
+     the page contributes a 50px gutter (max-w-6xl with px-4/sm:px-6 either
+     side). So the table first fits at a 831px viewport, measured. 840 is that
+     number with a little headroom rather than sitting one pixel off the cliff.
+
+     Both stock breakpoints sit far under 831, which is how the original 640px
+     switch silently clipped the two rightmost columns everywhere between 640px
+     and ~830px. Picking 800 would have fixed most of the range and left a
+     30px band still cut off — the gutter is easy to forget, which is why the
+     sweep measures the wrapper rather than the viewport.
+
+     If a column is ever added or widened, this number has to move with it. The
+     responsive sweep asserts the relationship directly — table scrollWidth
+     against clientWidth at every width — so a drift shows up as a failure
+     rather than as quietly missing data. */
+  --breakpoint-feed: 840px;
+}

@@ -97,11 +97,20 @@ export default function PaymentsFeed({ onSelect }: Props) {
           {/* Two layouts of the same rows, each built from cellsFor below, so a
               column added or renamed changes both at once. A table forced into
               blocks by CSS would keep one DOM tree but lose its semantics; two
-              trees built from one definition keep both honest. */}
-          <div className="hidden sm:block">
+              trees built from one definition keep both honest.
+
+              The switch is at the `feed` breakpoint (840px, defined in
+              index.css), not at Tailwind's sm. That number is the table's minimum
+              content width plus the page gutter, measured rather than picked: at sm (640px)
+              the table rendered in a container narrower than it could draw, and
+              the wrapper's overflow-hidden turned that into two silently missing
+              columns rather than anything a reader could notice. Cards exist so
+              a narrow viewport never needs horizontal scrolling, so the honest
+              fix is to show them wherever the table would not fit. */}
+          <div className="hidden feed:block">
             <PaymentsTable payments={state.payments} onSelect={onSelect} />
           </div>
-          <div className="sm:hidden">
+          <div className="feed:hidden">
             <PaymentCards payments={state.payments} onSelect={onSelect} />
           </div>
 
@@ -181,7 +190,13 @@ function PaymentsTable({ payments, onSelect }: LayoutProps) {
   const headers = cellsFor(payments[0])
 
   return (
-    <div className="overflow-hidden rounded-lg border border-slate-200 bg-white">
+    // overflow-x-auto rather than overflow-hidden. The breakpoint above is what
+    // actually prevents a cramped table, so this should never engage — it is the
+    // failure mode if it ever does. A column added without moving the breakpoint
+    // then produces a scrollbar, which is visible, instead of two columns that
+    // quietly stop being drawn. Rounded corners still clip, because any overflow
+    // value other than visible establishes the clipping the border-radius needs.
+    <div className="overflow-x-auto rounded-lg border border-slate-200 bg-white">
       <table className="w-full text-left text-sm">
         <thead className="border-b border-slate-200 bg-slate-50 text-xs uppercase tracking-wide text-slate-600">
           <tr>

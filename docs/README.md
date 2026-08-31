@@ -331,25 +331,39 @@ those, which is accurate rather than a gap.
   `vitest/config` rather than `vite`, because vite's own type rejects the `test`
   key and `npm run build` fails type-checking.
 
-- **The payments feed table clips its two rightmost columns between 640px and
-  roughly 780px.** The table has a minimum content width of about 781px, and its
-  wrapper carries `overflow-hidden` (for the rounded corners), so between the
-  `sm` breakpoint at 640px and about 780px the Amount and Attempts columns are
-  cut off rather than scrollable. The page itself never scrolls sideways —
-  `documentElement.scrollWidth` equals `window.innerWidth` at every width
-  measured — so the clipping is silent.
+- **The payments feed table clipped its rightmost columns between 640px and
+  ~830px (found and fixed).** The table has a minimum content width of 781px and
+  its wrapper carried `overflow-hidden` for the rounded corners, so wherever the
+  container was narrower the Amount and Attempts columns were simply not drawn.
+  The page never scrolled sideways — `documentElement.scrollWidth` equalled
+  `window.innerWidth` throughout — so nothing revealed it. Day 6's responsive
+  check measured 1280, 640, 639 and 375 and stepped straight over the range;
+  it was found during Day 7's sweep of the three new panels.
 
-  Below 640px there is no problem: the table is replaced by the stacked card
-  layout, which shows every field. This affects a narrow band of tablet-ish
-  widths only. Day 6's responsive check measured 1280, 640, 639 and 375 and so
-  passed straight over the affected range. The fix is either `overflow-x-auto` on
-  the wrapper or moving the card breakpoint up; neither was done, because the
-  finding arrived during a test-and-documentation pass and changing layout was
-  out of its scope.
+  Fixed by moving the card/table switch to a `feed` breakpoint at 840px
+  (`--breakpoint-feed` in `frontend/src/index.css`) instead of Tailwind's `sm`.
+  Cards exist precisely so a narrow viewport never needs horizontal scrolling, so
+  showing them wherever the table cannot fully render is the fix that matches the
+  design rather than working around it.
 
-  The three Day 7 panels — batch summary, control panel, escalation queue — were
-  measured at 1280, 640, 639 and 375 and have zero overflowing children at every
-  width.
+  **840 is measured, not chosen.** The table needs 781px and the page contributes
+  a 50px gutter (`max-w-6xl` with `px-4`/`sm:px-6`), so the first viewport at
+  which it fits is 831px; 840 adds headroom. The obvious guess of 800px — the
+  table's own width rounded up — was tried first and left a 30px band with the
+  Attempts column still off-screen, because it ignored the gutter. That is why
+  the sweep asserts against the *wrapper's* width and against each rendered
+  header's position, not against the viewport.
+
+  The wrapper is now `overflow-x-auto` rather than `overflow-hidden`. The
+  breakpoint is what actually prevents a cramped table, so this should never
+  engage; it is the failure mode if a column is ever added without moving the
+  breakpoint, turning silent truncation into a visible scrollbar.
+
+  Verified by sweeping every 20px from 375 to 1280, plus the boundary widths
+  either side of the switch: 54 widths, zero clipped columns, zero horizontal
+  page scroll, and one of the two layouts always active. The three Day 7 panels
+  were measured across the same range with zero overflowing children.
+
 
 ## Known test-fidelity limitations
 
