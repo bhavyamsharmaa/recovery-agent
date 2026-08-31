@@ -52,5 +52,20 @@ export default defineConfig({
     // minWorkers is not in the config type and fails `tsc -b`, so only the
     // ceiling is set — it is the constraint that matters.
     maxWorkers: 1,
+
+    // A run that loses a file must not exit 0.
+    //
+    // maxWorkers: 1 made the startup timeout rare rather than impossible — the
+    // run still occasionally reports "Test Files 1 passed (1)" with the jsdom
+    // file missing, depending on what else the machine is doing. Tuning a race
+    // is not a fix, so the race is stopped from passing silently instead:
+    // dangerouslyIgnoreUnhandledErrors defaults to false, and these two make
+    // the consequence explicit rather than advisory.
+    //
+    // passWithNoTests catches only the total-wipeout case. The one-file-missing
+    // case is caught by scripts/check-suite.mjs, which `npm test` runs after
+    // vitest and which fails unless every file in `include` reported.
+    passWithNoTests: false,
+    dangerouslyIgnoreUnhandledErrors: false,
   },
 })

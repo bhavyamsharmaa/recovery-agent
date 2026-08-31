@@ -6,14 +6,20 @@
 // JSON: no SQL is written twice, so the two views can never disagree about what
 // a payment's history is.
 //
-// KNOWN LIMITATION — there is no authentication on these routes. Anyone who can
-// reach the port can read every failed payment, its amount, and the customer
-// message sent about it. That is acceptable for local development against a
-// development database and is not acceptable anywhere else: before this is
-// deployed it needs, at minimum, an authenticated operator session, and the
-// CORS origin below tightened to the real frontend's origin. The endpoints are
-// read-only, which limits the damage to disclosure rather than mutation, but
-// disclosure of payment data is not a small thing.
+// Every route here is behind the shared-secret gate in auth.go — reads and
+// writes alike, with no exceptions — and the server refuses to start if
+// API_ACCESS_KEY is unset. NewHandler itself does not apply that gate: main
+// wraps this handler with NewAuth. The routes are registered on a mux owned by
+// this handler, so a route added below is covered by construction rather than
+// by remembering to check.
+//
+// KNOWN LIMITATION — one shared secret is not an operator session. It does not
+// identify who is calling, cannot be revoked for one person without rotating it
+// for everyone, and appears in full in any log that records request headers.
+// It is the difference between "anyone who finds the port" and "anyone who
+// holds the key", which is the gap worth closing first, not the last one. The
+// CORS origin below still wants tightening from its localhost default before
+// this is deployed.
 package api
 
 import (
@@ -115,7 +121,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// browser's preflight for that one route fails and the button appears
 		// broken for reasons nothing in the console explains.
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		// X-API-Key is advertised because auth.go requires it on every route
+		// here. A browser will not send a header the preflight did not permit,
+		// so omitting it would make every dashboard request fail the key check
+		// while the header sat unsent — reported in the console as a CORS
+		// error, which sends the reader looking at origins rather than at the
+		// header list.
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}

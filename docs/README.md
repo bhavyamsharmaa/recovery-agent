@@ -16,27 +16,62 @@ Every route the dashboard talks to. Three of them write.
 | POST | `/api/simulate/duplicate` | **YES** | Delivers one event id twice and reports both results |
 | POST | `/api/simulate/llm-failure` | **YES** | Forces the decision layer to fail for that one request |
 
-### The write endpoints are unauthenticated. This is an accepted risk, not an oversight.
+### Every /api/ route requires a shared secret
 
-**Anyone who can reach port 8080 can manufacture payment records and spend real
-Claude API budget.** There is no authentication, no API key, no session, and no
-rate limit on any of these routes. A single unauthenticated `POST` creates
-`failed_payments`, `decisions` and `outcomes` rows that are indistinguishable
-from real traffic afterwards, and each payment in a batch makes a real model
-call that is billed.
+All nine routes above — reads and writes alike, no exceptions — are behind
+`X-API-Key`, checked against `API_ACCESS_KEY` before the request reaches a
+handler. A missing or wrong header is `401` with a JSON body.
 
-This was decided deliberately for a local buildathon demo and is documented here
-rather than left implied. It is **not** acceptable for any deployment. Before
-this is exposed anywhere:
+The check is middleware wrapping the whole `/api/` subtree
+([backend/internal/api/auth.go](../backend/internal/api/auth.go)), not a call
+inside each handler. A per-handler check is one route away from being
+forgotten, and the route most likely to be forgotten is the newest one; here a
+route registered on the mux is covered by construction.
 
-- add an authenticated operator session in front of `/api/`,
-- tighten `FRONTEND_ORIGIN` from the `http://localhost:5173` default,
-- and consider whether the `/api/simulate/` routes should exist outside a demo
+**The server refuses to start when `API_ACCESS_KEY` is unset.** `NewAuth`
+returns an error and `main` exits. A server that booted without a key and served
+anyway would look entirely healthy while exposing every payment record, and
+nothing in a successful response would reveal the check was not running.
+
+Three details that are deliberate:
+
+- **Comparison is constant-time** (`subtle.ConstantTimeCompare`). `==` returns
+  at the first differing byte, so how long a rejection takes leaks how long a
+  correct prefix was.
+- **The 401 does not say whether the header was missing or wrong.** Both mean
+  "you may not have this"; distinguishing them confirms the mechanism to someone
+  probing. The distinction is logged instead, as `api_auth_rejected` with
+  `header_present`, because an operator debugging a 401 does need it.
+- **CORS preflight passes without the key**, and must: a browser sends `OPTIONS`
+  with no custom headers, since the preflight is what asks permission to send
+  `X-API-Key` at all. It discloses nothing and is identical either way.
+
+`/webhook/payment-failed` is **not** behind this gate. Razorpay cannot send our
+header, and that endpoint's authenticity problem is signature verification —
+a separate piece of work that this secret does not solve and must not be
+mistaken for. **That endpoint remains unauthenticated today.**
+
+#### What this is not
+
+One shared secret is not an operator session. It does not identify who is
+calling, cannot be revoked for one person without rotating it for everyone, and
+appears in full in any log that records request headers. On the frontend it is
+a build-time value baked into the bundle by Vite, so **anyone who can load the
+dashboard can read the key out of the JavaScript** — the moment the dashboard is
+public, the key is too.
+
+It closes the gap between "anyone who finds the port" and "anyone who has been
+given the dashboard", which is the one worth closing first. Still outstanding
+before this is public:
+
+- a real operator session with per-user identity and revocation,
+- `FRONTEND_ORIGIN` tightened from its `http://localhost:5173` default,
+- rate limiting — the key bounds *who* can spend model budget, not how fast,
+- and a decision about whether `/api/simulate/` should exist outside a demo
   build at all.
 
-Two partial mitigations exist, and they are only that. `POST /api/batch-runs`
-caps `size` at 200 and serialises runs behind a lock, returning `409` if one is
-already in progress — that bounds a single request, not a determined caller.
+`POST /api/batch-runs` also caps `size` at 200 and serialises runs behind a
+lock, returning `409` if one is already in progress.
 
 ### The forced decision failure is request-scoped, and that is the point
 
@@ -196,18 +231,42 @@ those, which is accurate rather than a gap.
   which is why the live calibration test asks for a majority of runs below the
   threshold rather than all of them.
 
-- **The read-only JSON API has no authentication.** `internal/api` serves
-  `GET /api/payments` and `GET /api/payments/{id}` to anyone who can reach port
-  8080. Those responses carry every failed payment's amount, error detail, the
-  model's reasoning, and the message sent to the customer. This is acceptable
-  for local development against a development database and for nothing else:
-  before deployment it needs an authenticated operator session, and the
-  permitted CORS origin — `http://localhost:5173` by default, overridable with
-  `FRONTEND_ORIGIN` — tightened to the real frontend. The endpoints are
-  read-only, which limits the exposure to disclosure rather than mutation, but
-  disclosure of payment data is not a small thing. The CORS headers are attached
-  only to `/api/` routes; the webhook endpoint is called by Razorpay, not a
-  browser, and advertises no origin.
+- **The JSON API's authentication is one shared secret, not a session
+  (partially addressed).** Every `/api/` route now requires `X-API-Key` and the
+  server will not start without `API_ACCESS_KEY` set — see "Every /api/ route
+  requires a shared secret" above, which also records what a single shared
+  secret still does not give you: no per-user identity, no revocation without
+  rotating for everyone, and a key readable in the frontend bundle by anyone who
+  can load the dashboard. The permitted CORS origin —
+  `http://localhost:5173` by default, overridable with `FRONTEND_ORIGIN` —
+  still wants tightening to the real frontend before deployment. The CORS
+  headers are attached only to `/api/` routes; the webhook endpoint is called by
+  Razorpay, not a browser, advertises no origin, and is deliberately outside the
+  key gate because its authenticity problem is signature verification, which is
+  **not yet built**.
+
+- **The listen port comes from `PORT`, defaulting to 8080.** It was hardcoded,
+  which fails on any host that assigns a port dynamically: the process binds
+  somewhere the platform is not routing to, then fails a health check while its
+  own logs look perfectly healthy. The `server_up` line prints the address it
+  actually bound, so the log answers the question rather than implying it.
+
+- **SIGTERM shuts down gracefully, with a 10s budget.** The listener stops
+  accepting, in-flight requests finish, then the process exits. This matters
+  most for a webhook delivery caught mid-processing: it has already been counted
+  as an attempt and may have spent a model call, so killing it there leaves a
+  payment recorded with no decision, and Razorpay redelivers into a system that
+  already charged an attempt against it.
+
+  The 10s bound is deliberate and it is not enough for everything. **A batch run
+  holds its request open far longer and will be cut off**, logged as
+  `graceful shutdown incomplete`. That is the right trade: hosts send SIGKILL on
+  their own deadline regardless, so an unbounded wait would hand the decision to
+  the host rather than making it here. Verified by signalling the server with a
+  batch mid-flight — the request returned 200, then `shutdown_complete`.
+
+  SIGINT is handled identically, which is what makes this testable on Windows:
+  a console CTRL_BREAK arrives as SIGINT and exercises the same path.
 
 - **The API's queries are shared with `cmd/trace-payment`, in `internal/trace`.**
   They began in the command, which could not be imported because it is
@@ -333,11 +392,26 @@ those, which is accurate rather than a gap.
   run. This is the same hazard as the "no tests" output and harder to catch,
   because the tally is non-zero and rising.
 
-  Fixed by holding the run to a single worker across all files — `maxWorkers: 1`
-  and `minWorkers: 1` — so no second handshake happens at all. The timeout is
-  hit during worker *startup*, so starting fewer workers is the fix; raising the
-  timeout would only make a broken run slower. The suite now runs both files,
-  47 tests, in about 3 seconds.
+  Reduced by holding the run to a single worker — `maxWorkers: 1` (`minWorkers`
+  is not in the config type and fails `tsc -b`). The timeout is hit during
+  worker *startup*, so starting fewer workers helps where raising the timeout
+  would only make a broken run slower. The suite runs both files, 47 tests, in
+  about 3 seconds.
+
+  **`maxWorkers: 1` made it rare, not impossible.** A later run dropped the
+  jsdom file again — 36 tests, one "Unhandled Error", exit 0 — so it depends on
+  what else the machine is doing. Tuning a race is not a fix, so the race is no
+  longer allowed to pass silently: `npm test` runs
+  `frontend/scripts/check-suite.mjs` after vitest, which compares the files that
+  reported in the JSON output against the files on disk matching the same
+  `include` glob, and exits 1 naming any that did not run. It is compared
+  against the glob rather than a hardcoded count so that adding a test file
+  needs no change and deleting one cannot silently lower the bar.
+
+  That guard was watched to fail before being trusted, the same way the dedupe
+  concurrency test was: running vitest against only `batchMath.test.ts` and
+  then invoking it reports `1 test file(s) did not run:
+  src/components/BatchSummary.test.tsx` and exits 1.
 
   These are top-level `test` options in Vitest 4. The v3 spelling,
   `poolOptions.threads.singleThread`, was removed in that release and is

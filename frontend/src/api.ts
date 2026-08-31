@@ -8,6 +8,20 @@
 
 const BASE_URL = import.meta.env.VITE_API_BASE_URL
 
+/**
+ * The shared secret every /api/ route requires. Sent as X-API-Key on every
+ * request by `request()` below, which is the only place fetch is called — so a
+ * new endpoint added to this file is authenticated by construction rather than
+ * by remembering to add a header.
+ *
+ * This is a build-time value baked into the bundle by Vite, which means anyone
+ * who can load the dashboard can read it out of the JavaScript. It is not a
+ * per-user credential and does not pretend to be one: it keeps the API closed
+ * to anyone who has not been given the dashboard, and the moment the dashboard
+ * is public the key is too. An operator session is what replaces it.
+ */
+const API_KEY = import.meta.env.VITE_API_ACCESS_KEY
+
 /** One row of GET /api/payments: a failed payment plus its most recent decision. */
 export interface PaymentSummary {
   payment_id: string
@@ -206,7 +220,13 @@ export class ApiError extends Error {
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response
   try {
-    response = await fetch(`${BASE_URL}${path}`, init)
+    response = await fetch(`${BASE_URL}${path}`, {
+      ...init,
+      // Spread the caller's headers first so the key cannot be dropped by a
+      // call site that passes its own Content-Type — every route requires it,
+      // so no caller gets to opt out.
+      headers: { ...init?.headers, 'X-API-Key': API_KEY },
+    })
   } catch (cause) {
     // fetch rejects only on a network-level failure — the server being down,
     // DNS, CORS. Status 0 marks "the request never got an answer", which is a
@@ -226,6 +246,17 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // Keep statusText.
     }
+
+    // The backend's 401 body says only "unauthorized", deliberately — it will
+    // not tell a caller whether the header was missing or merely wrong. That
+    // is right for the wire and useless on screen, so the one thing the
+    // operator can actually act on is said here instead.
+    if (response.status === 401) {
+      detail = API_KEY
+        ? 'the API rejected this key: check VITE_API_ACCESS_KEY matches the backend API_ACCESS_KEY'
+        : 'VITE_API_ACCESS_KEY is not set in this build, so no key was sent'
+    }
+
     throw new ApiError(response.status, detail)
   }
 
