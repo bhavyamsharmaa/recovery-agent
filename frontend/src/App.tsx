@@ -1,4 +1,7 @@
 import { useState } from 'react'
+import BatchSummary from './components/BatchSummary'
+import ControlPanel from './components/ControlPanel'
+import EscalationQueue from './components/EscalationQueue'
 import PaymentDetail from './components/PaymentDetail'
 import PaymentsFeed from './components/PaymentsFeed'
 
@@ -27,7 +30,14 @@ export default function App() {
 
       <main className="mx-auto max-w-6xl px-4 py-8 sm:px-6">
         {selected === null ? (
-          <PaymentsFeed onSelect={setSelected} />
+          // The summary sits above the feed, not beside or below it: it is the
+          // screen's headline answer, and the feed is the evidence behind it.
+          <div className="flex flex-col gap-8">
+            <BatchSummary />
+            <ControlPanel />
+            <EscalationQueue />
+            <PaymentsFeed onSelect={setSelected} />
+          </div>
         ) : (
           <PaymentDetail paymentId={selected} onBack={() => setSelected(null)} />
         )}

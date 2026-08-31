@@ -63,9 +63,12 @@ export interface Decision {
 }
 
 /**
- * A recorded outcome. Nothing in the backend writes this table yet, so the
- * array is reliably empty today; it is typed anyway so the shape does not
- * change on the frontend the day something starts writing to it.
+ * A recorded outcome.
+ *
+ * Written only by batch runs, never by live webhook traffic — so a payment that
+ * arrived through a real webhook has an empty array here, correctly, because
+ * nothing has confirmed what happened to it. Payments generated inside a batch
+ * carry one, and it is a seeded simulation rather than an observation.
  */
 export interface Outcome {
   outcome: string
@@ -78,6 +81,95 @@ export interface PaymentDetail {
   payment: PaymentRecord
   decisions: Decision[]
   outcomes: Outcome[]
+}
+
+/**
+ * One batch run: N simulated failures put through the real pipeline, scored
+ * against a blind-retry baseline.
+ *
+ * Every result field is nullable because the row is written when a run starts
+ * and filled in when it finishes. Null here means "this run never completed",
+ * which is a different statement from a run that completed having recovered
+ * nothing — so these must not be coerced to 0 on the way in.
+ */
+export interface BatchRun {
+  id: number
+  /** RFC 3339, always UTC with a trailing Z. */
+  started_at: string
+  completed_at: string | null
+  batch_size: number
+  /** The seed that reproduces this run's scenario mix, amounts and outcome draws. */
+  rng_seed: number
+
+  total_at_risk_paise: number | null
+  total_recovered_paise: number | null
+  /** 0..1, not a percentage. Multiply for display. */
+  recovery_rate: number | null
+  baseline_recovered_paise: number | null
+  baseline_recovery_rate: number | null
+
+  /**
+   * recovery_rate - baseline_recovery_rate, already in percentage points.
+   *
+   * Computed by the backend rather than here on purpose: it is the headline
+   * number of the whole feature, and two clients deriving it independently is
+   * two chances to derive it differently.
+   */
+  improvement_points: number | null
+}
+
+/**
+ * A decision as the demo control panel reports it, straight after firing a
+ * simulated failure through the real pipeline.
+ *
+ * `action` and `source` are empty strings only if the payment somehow received
+ * no decision at all, which the panel renders as such rather than hiding.
+ */
+export interface SimulatedDecision {
+  payment_id: string
+  category: string
+  amount_paise: number
+  attempt_count: number
+  action: string
+  source: string
+  /** Null for stopping-rule and fallback decisions — never 0. */
+  confidence: number | null
+  reasoning: string | null
+  customer_message: string | null
+  escalation_reason: string | null
+  original_action: string | null
+}
+
+/** One webhook delivery in the duplicate demo. */
+export interface SimulatedDelivery {
+  event_id: string
+  /**
+   * "processed" or "duplicate", derived by the backend from what the database
+   * shows before and after the delivery — not from the HTTP status, which is
+   * 200 for both by design.
+   */
+  status: string
+  attempt_count: number
+  decisions_for_payment: number
+  http_status: number
+}
+
+export interface SimulateFailureResult {
+  event_id: string
+  decision: SimulatedDecision
+}
+
+export interface SimulateDuplicateResult {
+  event_id: string
+  deliveries: SimulatedDelivery[]
+  decision: SimulatedDecision
+}
+
+export interface SimulateLLMFailureResult {
+  event_id: string
+  webhook_http_status: number
+  forced: boolean
+  decision: SimulatedDecision
 }
 
 /** The backend's error body, sent on a 404 and on a failed query. */
@@ -101,10 +193,10 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string): Promise<T> {
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response
   try {
-    response = await fetch(`${BASE_URL}${path}`)
+    response = await fetch(`${BASE_URL}${path}`, init)
   } catch (cause) {
     // fetch rejects only on a network-level failure — the server being down,
     // DNS, CORS. Status 0 marks "the request never got an answer", which is a
@@ -157,4 +249,125 @@ export async function getPayments(filters?: {
  */
 export async function getPaymentDetail(paymentId: string): Promise<PaymentDetail> {
   return request<PaymentDetail>(`/api/payments/${encodeURIComponent(paymentId)}`)
+}
+
+/**
+ * getLatestBatchRun fetches the most recently completed run.
+ *
+ * Throws an ApiError with status 404 when no batch has ever been run. That is
+ * an ordinary answer on a fresh database, not a malfunction, and the caller
+ * should render it as "no runs yet" rather than as an error.
+ */
+export async function getLatestBatchRun(): Promise<BatchRun> {
+  return request<BatchRun>('/api/batch-runs/latest')
+}
+
+/** getBatchRuns fetches run history, most recent first. */
+export async function getBatchRuns(): Promise<BatchRun[]> {
+  return request<BatchRun[]>('/api/batch-runs')
+}
+
+/**
+ * runBatch triggers a new batch and resolves with its finished summary.
+ *
+ * This is the one call in this client that writes. It is also slow by nature —
+ * every payment in the batch makes a real model call through the real webhook
+ * path — so the request stays open for as long as the run takes, and the caller
+ * must show a loading state rather than assuming it will return promptly.
+ *
+ * A 409 means a run is already in progress; the backend refuses to start a
+ * second one because two concurrent batches would interleave through one
+ * attempt counter and produce figures describing nothing reproducible.
+ */
+export async function runBatch(options?: { size?: number; seed?: number }): Promise<BatchRun> {
+  return request<BatchRun>('/api/batch-runs', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(options ?? {}),
+  })
+}
+
+/**
+ * simulateFailure fires one real webhook in the given category and returns the
+ * decision the pipeline actually reached.
+ *
+ * Real, not mocked: the delivery goes through the same classifier, stopping
+ * rule, decision layer and confidence gate as production traffic, so the action
+ * and confidence shown are genuinely what the agent decided.
+ */
+export async function simulateFailure(category: string): Promise<SimulateFailureResult> {
+  return request<SimulateFailureResult>(
+    `/api/simulate/failure?category=${encodeURIComponent(category)}`,
+    { method: 'POST' },
+  )
+}
+
+/**
+ * simulateDuplicate delivers one event id twice and returns both results.
+ *
+ * Both deliveries answer HTTP 200 — that is the contract, since telling Razorpay
+ * to retry something already handled is worse than acknowledging it — so the
+ * demonstration is in the returned `status` fields and the unchanged attempt
+ * count, which the backend derives from observed database state.
+ */
+export async function simulateDuplicate(): Promise<SimulateDuplicateResult> {
+  return request<SimulateDuplicateResult>('/api/simulate/duplicate', { method: 'POST' })
+}
+
+/**
+ * simulateLLMFailure forces the decision layer to fail for one request and
+ * returns the fallback decision that resulted.
+ *
+ * The forcing is request-scoped on the backend: no environment variable, no
+ * restart, and no way to trigger it from the real webhook endpoint.
+ */
+export async function simulateLLMFailure(): Promise<SimulateLLMFailureResult> {
+  return request<SimulateLLMFailureResult>('/api/simulate/llm-failure', { method: 'POST' })
+}
+
+/**
+ * One case in the escalation queue: a payment whose latest decision stopped
+ * automated handling and left it for a person.
+ *
+ * The reasoning and customer message are carried inline because the queue's job
+ * is to answer "why does a human need to look at this" — an answer behind
+ * another request is one a reviewer scanning a list will not read.
+ */
+export interface Escalation {
+  payment_id: string
+  category: string
+  payment_method: string
+  amount_paise: number
+  error_reason: string
+  attempt_count: number
+  first_failed_at: string
+  last_seen_at: string
+
+  decision_id: number
+  attempt_number: number
+  /** Always "escalate" or "no_retry" — the two actions that stop the machine. */
+  action: string
+  source: string
+  decided_at: string
+
+  /** Null for stopping-rule and fallback decisions — never 0. */
+  confidence: number | null
+
+  /**
+   * Null for a genuine fallback_rule case, and that is not a missing value: the
+   * fallback fires when the system could not reason at all, so there is no
+   * policy reason to name. Render it as its own category, not as a blank.
+   */
+  escalation_reason: string | null
+
+  /** Set when the confidence gate overrode the model, naming what it replaced. */
+  original_action: string | null
+
+  reasoning: string | null
+  customer_message: string | null
+}
+
+/** getEscalations lists cases waiting on a human, most recently decided first. */
+export async function getEscalations(): Promise<Escalation[]> {
+  return request<Escalation[]>('/api/escalations')
 }
