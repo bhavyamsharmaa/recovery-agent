@@ -111,6 +111,20 @@ either starts mattering, that is the moment to add react-router.
   it fills up; it does not invent a status in the meantime.
 - **Authentication.** The API it reads is unauthenticated, so this dashboard is
   local-development only. See the backend's `docs/README.md`.
-- **Tests.** The backend is well covered; this app is not. What is worth testing
-  here is small and specific — the null-confidence rendering, the override
-  guard, the two distinct empty states.
+- **Tests cover the recovery math, and deliberately nothing else.** 43 tests in
+  two files, run with `npm run test`. They are scoped to the Batch Recovery
+  Summary because it is the only view that computes rather than renders, and its
+  numbers are what a reader takes away from the screen: the percentage
+  formatting, the client-side rupee delta, and the case where the naive baseline
+  beats the agent — which must render as a negative improvement rather than
+  being formatted around.
+
+  Untested by choice: the feed, the detail view, the control panel and the
+  escalation queue. Those render server data without transforming it, and their
+  correctness is pinned by the backend's own tests instead.
+
+  `vitest.config` sets `pool: 'threads'` and `fileParallelism: false`. The
+  default forked-worker pool hangs on at least one machine and then reports
+  "no tests", which reads as a pass — see the backend's `docs/README.md` for the
+  detail. If this suite ever reports "no tests", that is the first thing to
+  check rather than a sign that everything passed.

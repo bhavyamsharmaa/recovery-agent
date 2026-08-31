@@ -1,5 +1,72 @@
 An agent that classifies failed payments and recovers them with policy-driven retries.
 
+## Day 7 API surface
+
+Every route the dashboard talks to. Three of them write.
+
+| Method | Route | Writes? | What it does |
+|---|---|---|---|
+| GET | `/api/payments` | no | Failed payments, most recently seen first; `?category=` and `?action=` filter server-side |
+| GET | `/api/payments/{id}` | no | One payment's full history; 404 with a JSON body if never ingested |
+| GET | `/api/escalations` | no | Payments whose latest decision was `escalate` or `no_retry`, with reasoning inline |
+| GET | `/api/batch-runs` | no | Batch history, most recent first, including runs that never completed |
+| GET | `/api/batch-runs/latest` | no | The most recently **completed** run; 404 when none exists |
+| POST | `/api/batch-runs` | **YES** | Runs a batch: writes `batch_runs` and `outcomes`, and spends model budget |
+| POST | `/api/simulate/failure?category=X` | **YES** | Fires one real webhook and returns the decision |
+| POST | `/api/simulate/duplicate` | **YES** | Delivers one event id twice and reports both results |
+| POST | `/api/simulate/llm-failure` | **YES** | Forces the decision layer to fail for that one request |
+
+### The write endpoints are unauthenticated. This is an accepted risk, not an oversight.
+
+**Anyone who can reach port 8080 can manufacture payment records and spend real
+Claude API budget.** There is no authentication, no API key, no session, and no
+rate limit on any of these routes. A single unauthenticated `POST` creates
+`failed_payments`, `decisions` and `outcomes` rows that are indistinguishable
+from real traffic afterwards, and each payment in a batch makes a real model
+call that is billed.
+
+This was decided deliberately for a local buildathon demo and is documented here
+rather than left implied. It is **not** acceptable for any deployment. Before
+this is exposed anywhere:
+
+- add an authenticated operator session in front of `/api/`,
+- tighten `FRONTEND_ORIGIN` from the `http://localhost:5173` default,
+- and consider whether the `/api/simulate/` routes should exist outside a demo
+  build at all.
+
+Two partial mitigations exist, and they are only that. `POST /api/batch-runs`
+caps `size` at 200 and serialises runs behind a lock, returning `409` if one is
+already in progress — that bounds a single request, not a determined caller.
+
+### The forced decision failure is request-scoped, and that is the point
+
+`POST /api/simulate/llm-failure` makes the decision layer fail for its own
+request only. Day 4 had a `FORCE_DECIDE_FAILURE` environment variable for this
+and it was removed before merge, because a global switch that breaks decisions is
+one deployment mistake away from breaking them in production with nothing in a
+request to reveal it.
+
+The replacement is a value on the request's `context`, set by that one endpoint
+(`ingest.WithForcedDecideFailure`) and read by `ingest.ForcedFailureDecider`,
+which is otherwise a pass-through to the real client. The key type is unexported,
+so no package outside `ingest` can set it even by accident, and a context value
+cannot cross an HTTP boundary — which is why the simulate endpoints dispatch
+in-process rather than over a loopback.
+
+`TestWebhookCannotBeForcedToFailByAnyInput` pins the guarantee: it drives the
+real handler with headers, query parameters and body fields named after the
+mechanism, including all of them at once, and asserts the model was reached every
+time. `TestSimulateEndpointsDoNotLeakTheForcedFailure` covers the subtler
+variant — that forcing one failure does not affect the next request.
+
+### Outcomes on demo traffic
+
+Only `cmd/run-batch` and `POST /api/batch-runs` write `outcomes`. A payment that
+arrives through `/webhook/payment-failed`, including via the control panel's
+simulate buttons, gets a decision and no outcome — correctly, because nothing has
+confirmed what happened to it. The detail view says "no outcome recorded yet" for
+those, which is accurate rather than a gap.
+
 ## Known limitations
 
 - **Attempt counters are in-memory and reset on server restart.** They live
@@ -243,6 +310,46 @@ An agent that classifies failed payments and recovers them with policy-driven re
   calls a real gateway, these probabilities must be deleted rather than kept
   beside it, because a mixture of measured and invented outcomes in one table is
   worse than either alone.
+
+- **Vitest's default forked-worker pool hangs on this machine (worked around, root
+  cause unknown).** `vitest run` with the default `pool: 'forks'` never completes
+  its worker handshake here: every run dies after 60s with
+  `[vitest-pool-runner]: Timeout waiting for worker to respond` and then reports
+  `Test Files no tests` / `Tests no tests`. **That output reads as a pass to
+  anyone skimming**, which is the worst failure mode a suite can have — a green-
+  looking run that executed nothing.
+
+  Worked around in `frontend/vite.config.ts` with `pool: 'threads'` and
+  `fileParallelism: false`; the suite then runs in about 4 seconds. Serial
+  threads were needed, not just threads: two workers racing to hand-shake in
+  parallel both hit the timeout.
+
+  This is recorded as a machine-specific environment quirk and was deliberately
+  not investigated further. It has not been reproduced on another machine, and it
+  may not occur in CI. If the suite ever reports "no tests" again, this is the
+  first thing to check. Related: `defineConfig` must be imported from
+  `vitest/config` rather than `vite`, because vite's own type rejects the `test`
+  key and `npm run build` fails type-checking.
+
+- **The payments feed table clips its two rightmost columns between 640px and
+  roughly 780px.** The table has a minimum content width of about 781px, and its
+  wrapper carries `overflow-hidden` (for the rounded corners), so between the
+  `sm` breakpoint at 640px and about 780px the Amount and Attempts columns are
+  cut off rather than scrollable. The page itself never scrolls sideways —
+  `documentElement.scrollWidth` equals `window.innerWidth` at every width
+  measured — so the clipping is silent.
+
+  Below 640px there is no problem: the table is replaced by the stacked card
+  layout, which shows every field. This affects a narrow band of tablet-ish
+  widths only. Day 6's responsive check measured 1280, 640, 639 and 375 and so
+  passed straight over the affected range. The fix is either `overflow-x-auto` on
+  the wrapper or moving the card breakpoint up; neither was done, because the
+  finding arrived during a test-and-documentation pass and changing layout was
+  out of its scope.
+
+  The three Day 7 panels — batch summary, control panel, escalation queue — were
+  measured at 1280, 640, 639 and 375 and have zero overflowing children at every
+  width.
 
 ## Known test-fidelity limitations
 
