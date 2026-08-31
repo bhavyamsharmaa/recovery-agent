@@ -34,5 +34,23 @@ export default defineConfig({
     // cost is no parallelism across files, which is irrelevant at two files.
     pool: 'threads',
     fileParallelism: false,
+
+    // One worker for the whole run, not one per file.
+    //
+    // fileParallelism: false alone was not enough. The pool gives each worker
+    // 60s to hand-shake, jsdom's environment setup costs ~19s here, and the
+    // second file's worker still exceeded the budget: BatchSummary.test.tsx
+    // never started, while the run reported "Test Files 1 passed (1)" with the
+    // timeout relegated to an "Unhandled Error" block above the summary. A file
+    // that does not run must not be able to look like a file that passed.
+    //
+    // The timeout is hit during worker startup, so the fix is to start fewer
+    // workers rather than to wait longer for each.
+    // maxWorkers is a top-level option in Vitest 4; the v3 spelling
+    // poolOptions.threads.singleThread was removed in that release and is
+    // ignored without erroring, which would leave this fix resting on nothing.
+    // minWorkers is not in the config type and fails `tsc -b`, so only the
+    // ceiling is set — it is the constraint that matters.
+    maxWorkers: 1,
   },
 })

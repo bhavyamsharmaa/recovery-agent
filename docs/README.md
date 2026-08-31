@@ -324,6 +324,27 @@ those, which is accurate rather than a gap.
   threads were needed, not just threads: two workers racing to hand-shake in
   parallel both hit the timeout.
 
+  **That was not sufficient either, and the residue was worse than the original.**
+  Serialising the files still starts one worker per file, and the second one —
+  `BatchSummary.test.tsx`, the only file needing jsdom — kept exceeding the 60s
+  handshake budget on its own. The run then reported `Test Files 1 passed (1)` /
+  `Tests 36 passed (36)`, a green summary, with the timeout demoted to an
+  "Unhandled Error" block above it. The `.tsx` file's 11 tests silently did not
+  run. This is the same hazard as the "no tests" output and harder to catch,
+  because the tally is non-zero and rising.
+
+  Fixed by holding the run to a single worker across all files — `maxWorkers: 1`
+  and `minWorkers: 1` — so no second handshake happens at all. The timeout is
+  hit during worker *startup*, so starting fewer workers is the fix; raising the
+  timeout would only make a broken run slower. The suite now runs both files,
+  47 tests, in about 3 seconds.
+
+  These are top-level `test` options in Vitest 4. The v3 spelling,
+  `poolOptions.threads.singleThread`, was removed in that release and is
+  **ignored without erroring** — it was tried first, and the suite went green
+  for a different reason than the config claimed. If this ever regresses, check
+  that the option still exists before trusting it.
+
   This is recorded as a machine-specific environment quirk and was deliberately
   not investigated further. It has not been reproduced on another machine, and it
   may not occur in CI. If the suite ever reports "no tests" again, this is the
