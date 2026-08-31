@@ -21,6 +21,16 @@ type State =
   | { kind: 'error'; message: string }
   | { kind: 'loaded'; run: BatchRun }
 
+// Batch size fixed at 100 for the dashboard UI — smaller batches produce
+// statistically noisy results (an 8-payment run scored -6.4pp vs baseline in
+// testing) that would misrepresent the system during a live demo. The API and
+// CLI still accept any size 1-200; this is a UI-only guardrail.
+//
+// Sent explicitly rather than relying on the endpoint's own default, which is 20
+// and deliberately small because it holds a browser request open. Leaving it
+// implicit is what made the button run 20 payments while the CLI ran 100.
+const DASHBOARD_BATCH_SIZE = 100
+
 export default function BatchSummary() {
   const [state, setState] = useState<State>({ kind: 'loading' })
   const [running, setRunning] = useState(false)
@@ -51,7 +61,7 @@ export default function BatchSummary() {
     setRunning(true)
     setRunError(null)
     try {
-      const run = await runBatch()
+      const run = await runBatch({ size: DASHBOARD_BATCH_SIZE })
       setState({ kind: 'loaded', run })
     } catch (err) {
       setRunError(describe(err))
@@ -77,7 +87,9 @@ export default function BatchSummary() {
           className="inline-flex items-center gap-2 rounded-md bg-sky-700 px-4 py-2 text-sm font-medium text-white hover:bg-sky-800 disabled:cursor-not-allowed disabled:bg-slate-400"
         >
           {running && <Spinner />}
-          {running ? 'Running batch…' : 'Run new batch'}
+          {running
+            ? `Running batch… (${DASHBOARD_BATCH_SIZE} payments)`
+            : `Run new batch (${DASHBOARD_BATCH_SIZE} payments)`}
         </button>
       </header>
 
@@ -91,8 +103,8 @@ export default function BatchSummary() {
 
       {running && (
         <p className="mt-4 text-sm text-slate-600">
-          Running {'—'} each payment goes through the real classifier, stopping rule and
-          decision layer, so this takes a moment.
+          Running {DASHBOARD_BATCH_SIZE} payments {'—'} each one goes through the real
+          classifier, stopping rule and decision layer, so this takes a few minutes.
         </p>
       )}
       {runError !== null && <p className="mt-4 text-sm text-red-700">{runError}</p>}
@@ -102,7 +114,8 @@ export default function BatchSummary() {
         {state.kind === 'error' && <p className="text-sm text-red-700">{state.message}</p>}
         {state.kind === 'empty' && (
           <p className="text-sm text-slate-500">
-            No batch has been run yet. Press <strong>Run new batch</strong> to score one.
+            No batch has been run yet. Press <strong>Run new batch</strong> to score{' '}
+            {DASHBOARD_BATCH_SIZE} simulated failures.
           </p>
         )}
         {state.kind === 'loaded' && <Figures run={state.run} />}
