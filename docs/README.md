@@ -245,6 +245,18 @@ those, which is accurate rather than a gap.
   key gate because its authenticity problem is signature verification, which is
   **not yet built**.
 
+- **`API_ACCESS_KEY` is bundled into the frontend's shipped JavaScript by Vite
+  at build time**, since `VITE_`-prefixed env vars are inlined into the client
+  bundle by design. This means the shared-secret gate protects against
+  opportunistic scanning of the bare API by someone who doesn't know it exists —
+  it does **not** protect against someone who has legitimate access to the
+  dashboard URL extracting the key from browser dev tools and calling the API
+  directly with it. A true fix would require a server-side proxy
+  (backend-for-frontend) so the secret never reaches the browser at all — out of
+  scope for this project's timeline. Accepted as a documented tradeoff: this
+  gate's job is to stop casual/automated discovery of an open port, not to
+  resist a deliberate user of the dashboard itself.
+
 - **The listen port comes from `PORT`, defaulting to 8080.** It was hardcoded,
   which fails on any host that assigns a port dynamically: the process binds
   somewhere the platform is not routing to, then fails a health check while its
