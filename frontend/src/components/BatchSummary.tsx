@@ -1,5 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { ApiError, getLatestBatchRun, runBatch, type BatchRun } from '../api'
+import { formatPoints, formatRate, isImprovement, recoveredDelta } from '../batchMath'
 import { rupees, timestamp } from '../format'
 
 /**
@@ -110,7 +111,12 @@ export default function BatchSummary() {
   )
 }
 
-function Figures({ run }: { run: BatchRun }) {
+/**
+ * Figures renders a completed run. Exported for tests: it is a pure function of
+ * a BatchRun, so the whole comparison can be asserted without mocking fetch or
+ * standing up a backend.
+ */
+export function Figures({ run }: { run: BatchRun }) {
   // A run that never completed has no figures. Showing zeros would report it as
   // a batch that recovered nothing, which is a different and false claim.
   if (
@@ -202,7 +208,7 @@ function StatCard({ title, subtitle, amount, rate, emphasis = false }: StatCardP
           emphasis ? 'text-emerald-800' : 'text-slate-700'
         }`}
       >
-        {(rate * 100).toFixed(1)}%
+        {formatRate(rate)}
       </p>
       <p className={`text-xs ${emphasis ? 'text-emerald-700' : 'text-slate-500'}`}>recovery rate</p>
 
@@ -243,8 +249,8 @@ function Improvement({
     )
   }
 
-  const better = points >= 0
-  const delta = recovered - baseline
+  const better = isImprovement(points)
+  const delta = recoveredDelta(recovered, baseline)
 
   return (
     <div
@@ -258,8 +264,7 @@ function Improvement({
           better ? 'text-emerald-700' : 'text-amber-800'
         }`}
       >
-        {points >= 0 ? '+' : ''}
-        {points.toFixed(1)} percentage points
+        {formatPoints(points)} percentage points
       </p>
       <p className="mt-1 text-sm text-slate-600">
         {better ? 'Additional' : 'Less'} money recovered:{' '}
