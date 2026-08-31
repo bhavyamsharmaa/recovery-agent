@@ -154,6 +154,14 @@ type PaymentEntity struct {
 // a second event, which must be counted as an attempt rather than dropped.
 const eventIDHeader = "X-Razorpay-Event-Id"
 
+// maxWebhookBody bounds how much is read from a delivery before it is
+// verified. Real payment.failed payloads are a few kilobytes; this leaves
+// generous headroom while stopping an unauthenticated caller from streaming
+// unbounded data into memory. The signature cannot be checked without buffering
+// the body, so the limit has to sit in front of the check rather than behind
+// it.
+const maxWebhookBody = 1 << 20 // 1 MiB
+
 // Handler serves POST /webhook/payment-failed.
 type Handler struct {
 	// events deduplicates deliveries by event id. It defaults to the in-memory
@@ -165,6 +173,14 @@ type Handler struct {
 	attempts AttemptStore
 	decider  Decider
 
+	// verifier checks the Razorpay signature on every delivery. Never nil:
+	// NewHandler installs one that rejects everything, so a handler built
+	// without WithVerifier fails closed rather than accepting unsigned traffic.
+	// A nil-means-skip field would make "verification is off" the default and
+	// invisible, which is the wrong direction for the one endpoint facing the
+	// public internet.
+	verifier *verifier
+
 	// decisions is optional. Nil means decisions are logged but not stored,
 	// which is how every test that predates persistence still builds a Handler.
 	decisions DecisionRecorder
@@ -174,7 +190,25 @@ type Handler struct {
 // Day 5's Postgres implementation drops in at the construction site without
 // this package changing.
 func NewHandler(d Decider, a AttemptStore) *Handler {
-	return &Handler{decider: d, attempts: a, events: NewInMemoryEventStore()}
+	return &Handler{
+		decider:  d,
+		attempts: a,
+		events:   NewInMemoryEventStore(),
+
+		// Fails closed until WithVerifier supplies the real secret. The
+		// placeholder is a fresh random value, so nothing can be signed for it
+		// — including by code that knows this line exists.
+		verifier: unusableVerifier(),
+	}
+}
+
+// WithVerifier installs the signature check. A separate call rather than a
+// third parameter to NewHandler, matching WithEventStore and
+// WithDecisionRecorder, so every existing caller and test keeps the constructor
+// it already uses — and so the default stays fail-closed rather than absent.
+func (h *Handler) WithVerifier(v *verifier) *Handler {
+	h.verifier = v
+	return h
 }
 
 // WithEventStore swaps in durable deduplication. Like WithDecisionRecorder it
@@ -340,8 +374,52 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The raw bytes, before anything looks at them. Razorpay signs exactly what
+	// it sent, so verification has to run against exactly what arrived: parsing
+	// first and re-serialising to verify would hash a different byte sequence —
+	// Go's encoder orders keys, drops insignificant whitespace and reformats
+	// numbers — and every genuine delivery would fail its own signature.
+	//
+	// MaxBytesReader bounds the read. Without it an unauthenticated caller can
+	// stream indefinitely into memory, and this endpoint is public.
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxWebhookBody))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "webhook body could not be read: %v\n", err)
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	// Verification comes before parsing, classification, counting and every
+	// database write. An unverified delivery must not be able to reach any of
+	// them: the whole point is that nothing downstream acts on bytes that
+	// cannot be shown to have come from Razorpay.
+	if !h.verifier.verify(r, body) {
+		logLine(signatureRejectedLog{
+			Event:           "webhook_signature_invalid",
+			Path:            r.URL.Path,
+			HeaderPresent:   r.Header.Get(signatureHeader) != "",
+			SignatureLength: len(r.Header.Get(signatureHeader)),
+			BodyBytes:       len(body),
+			TS:              now(),
+		})
+
+		// 401 rather than 400: the body may be perfectly well-formed, and what
+		// is wrong is that it cannot be shown to have come from Razorpay.
+		//
+		// Razorpay retries non-2xx, so a genuine delivery rejected because of a
+		// secret mismatch will be redelivered rather than lost — the misconfig
+		// is recoverable by fixing the secret, without the payment disappearing.
+		w.Header().Set("content-type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprintln(w, `{"error":"invalid signature"}`)
+		return
+	}
+
+	// Parsed from the same bytes that were just verified, not from r.Body —
+	// which is now drained. Anything else would parse something other than what
+	// the signature covers.
 	var e Event
-	if err := json.NewDecoder(r.Body).Decode(&e); err != nil {
+	if err := json.Unmarshal(body, &e); err != nil {
 		fmt.Fprintf(os.Stderr, "webhook body did not parse: %v\n", err)
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return

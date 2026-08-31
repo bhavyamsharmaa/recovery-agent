@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"time"
 
 	"github.com/bhavyamsharmaa/recovery-agent/internal/ingest"
@@ -89,6 +90,16 @@ func (h *Handler) fireWebhook(ctx context.Context, eventID string, body []byte) 
 		WithContext(ctx)
 	req.Header.Set("content-type", "application/json")
 	req.Header.Set("x-razorpay-event-id", eventID)
+
+	// Signed like any other delivery. These endpoints dispatch through the real
+	// handler precisely so the demo exercises the real pipeline, and the
+	// signature check is now part of that pipeline — a bypass here would make
+	// the control panel demonstrate a path production does not have, and would
+	// be the one hole in an otherwise closed endpoint.
+	//
+	// The secret is read per call rather than cached at construction, so the
+	// key gate above stays the only reason these endpoints can fail at startup.
+	req.Header.Set("x-razorpay-signature", ingest.Sign(os.Getenv("RAZORPAY_WEBHOOK_SECRET"), body))
 
 	rec := httptest.NewRecorder()
 	h.webhook.ServeHTTP(rec, req)

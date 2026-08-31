@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"math/rand"
 	"net/http"
+	"os"
 	"time"
+
+	"github.com/bhavyamsharmaa/recovery-agent/internal/ingest"
 )
 
 // Scenario generation, moved here from cmd/simulate when cmd/run-batch needed
@@ -187,7 +190,24 @@ func Build(rng *rand.Rand, name, paymentID string) Event {
 }
 
 // Send POSTs one event to the webhook endpoint, carrying the event id in the
-// header where Razorpay puts it.
+// header where Razorpay puts it and signing the body the way Razorpay signs it.
+//
+// The secret comes from RAZORPAY_WEBHOOK_SECRET — the same variable the
+// receiver verifies against — so local testing works end to end without a real
+// Razorpay account, and so a signature this produces is valid for exactly the
+// deployment it was pointed at rather than universally.
+//
+// It reads the environment here rather than taking the secret as a parameter
+// because every caller would otherwise read the same variable and pass it
+// through unchanged, and one that forgot would send unsigned deliveries that
+// fail with a 401 nothing in the caller explains. An unset variable is left to
+// the receiver to reject: this is a test tool, and the honest behaviour is to
+// send what an unconfigured sender would send rather than to refuse locally
+// and hide what the server does with it.
+//
+// The signature is computed over `body` exactly as it is transmitted. Nothing
+// re-serialises it between here and the wire — bytes.NewReader sends these
+// bytes — which is the same property the receiver depends on.
 func Send(url, eventID string, body []byte) (int, error) {
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
@@ -197,6 +217,7 @@ func Send(url, eventID string, body []byte) (int, error) {
 	// Razorpay carries the event id in a header, not the body. It is the only
 	// stable handle a receiver has for deduplicating redeliveries.
 	req.Header.Set("x-razorpay-event-id", eventID)
+	req.Header.Set("x-razorpay-signature", ingest.Sign(os.Getenv("RAZORPAY_WEBHOOK_SECRET"), body))
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

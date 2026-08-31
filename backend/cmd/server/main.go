@@ -94,9 +94,22 @@ func main() {
 	// pass-through to the real client.
 	decider := &ingest.ForcedFailureDecider{Real: client}
 
+	// The webhook's own authentication, and the only thing standing in front of
+	// the one endpoint that must stay open to the internet. Fatal when unset,
+	// like the API key above: a receiver that could not verify signatures would
+	// accept anything posted at it — manufactured payments, spent model budget,
+	// fabricated decisions in the audit trail — and look healthy doing it,
+	// because an unverified delivery is processed exactly like a real one.
+	verifier, err := ingest.NewVerifier()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
 	handler := ingest.NewHandler(decider, attempts).
 		WithDecisionRecorder(decisions).
-		WithEventStore(events)
+		WithEventStore(events).
+		WithVerifier(verifier)
 	http.Handle("/webhook/payment-failed", handler)
 
 	// The JSON API, mounted as a subtree so its CORS headers apply to every

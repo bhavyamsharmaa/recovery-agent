@@ -47,9 +47,69 @@ Three details that are deliberate:
   `X-API-Key` at all. It discloses nothing and is identical either way.
 
 `/webhook/payment-failed` is **not** behind this gate. Razorpay cannot send our
-header, and that endpoint's authenticity problem is signature verification —
-a separate piece of work that this secret does not solve and must not be
-mistaken for. **That endpoint remains unauthenticated today.**
+header, and that endpoint's authenticity problem is signature verification,
+which it now has — see below. The two mechanisms are separate on purpose: this
+secret authenticates our own dashboard, that one authenticates Razorpay.
+
+### The webhook verifies Razorpay's signature
+
+`/webhook/payment-failed` requires a valid `X-Razorpay-Signature`: HMAC-SHA256
+of the raw request body under `RAZORPAY_WEBHOOK_SECRET`, hex-encoded, compared
+in constant time. A missing or wrong signature is `401` with a JSON body, logged
+as `webhook_signature_invalid`. **The server refuses to start when
+`RAZORPAY_WEBHOOK_SECRET` is unset**, like `API_ACCESS_KEY`.
+
+`RAZORPAY_WEBHOOK_SECRET` is not `RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET`. Those
+are API credentials for calling Razorpay; this one is set separately in their
+dashboard when the webhook is registered, and is the only value that can verify
+a delivery came from them. Signing with the API secret would verify nothing.
+
+**Verification runs on the raw bytes, before parsing.** The handler reads the
+body with `io.ReadAll`, verifies those exact bytes, and only then unmarshals the
+same slice. Parsing first and re-serialising to verify would hash a different
+byte sequence — Go's encoder orders keys, drops insignificant whitespace and
+reformats numbers — and every genuine delivery would fail its own signature.
+`TestSemanticallyEqualBodyWithDifferentBytesDoesNotVerify` pins this: four
+bodies that `json.Unmarshal` treats as identical all produce different
+signatures.
+
+**Rejection precedes everything.** No parsing, no classification, no attempt
+counting, no database write, and the event id is not consumed — recording it
+would make a later genuine delivery of that event look like a duplicate and be
+silently dropped. The tests assert the decider was never called and the stores
+are empty, not merely that the status was 401: a handler that rejected *after*
+doing all that work would pass a status-only assertion.
+
+A handler built without `WithVerifier` **rejects everything**. The default is a
+verifier holding a fresh random secret, not a nil that means "skip the check" —
+that would make "verification is off" both the default and invisible, on the one
+endpoint facing the public internet. There is no test-only bypass; the tests
+sign their requests like everyone else.
+
+The body is bounded at 1 MiB (`http.MaxBytesReader`) before it is read, since
+the signature cannot be checked without buffering and the endpoint is
+unauthenticated until it is.
+
+**The rejection discloses nothing.** No secret, no expected signature, and no
+payment id — the body has not been parsed, and parsing unverified input to
+enrich a log line is doing exactly the work the rejection exists to avoid. What
+is logged is `header_present` and `signature_length`, which separate "the sender
+is not signing at all" (a misconfiguration) from "signed with the wrong secret"
+(a key mismatch or a forgery), plus `body_bytes` — a mismatch when everything
+else looks right points at a proxy re-encoding the body in transit, which is
+otherwise invisible.
+
+**Local development signs with the same variable.** `internal/simulate.Send`
+computes the signature the handler expects, so `cmd/simulate`, `cmd/run-batch`
+and the dashboard's control panel all work end to end without a Razorpay
+account. The control panel's in-process dispatch signs too, rather than
+bypassing the check — a demo endpoint that skipped verification would exercise a
+path production does not have.
+
+One consequence worth stating: `Sign` is shared between the sender and the
+receiver, so if it is wrong, the simulator and the tests are wrong in exactly
+the same way and would still agree. The real check is against Razorpay's own
+deliveries, and no local reimplementation performs that check for us.
 
 #### What this is not
 
@@ -242,8 +302,18 @@ those, which is accurate rather than a gap.
   still wants tightening to the real frontend before deployment. The CORS
   headers are attached only to `/api/` routes; the webhook endpoint is called by
   Razorpay, not a browser, advertises no origin, and is deliberately outside the
-  key gate because its authenticity problem is signature verification, which is
-  **not yet built**.
+  key gate because its authenticity problem is signature verification, which it
+  now has — see "The webhook verifies Razorpay's signature" above.
+
+- **The webhook's signature secret is a single static value with no rotation
+  path.** Verification is against one `RAZORPAY_WEBHOOK_SECRET`, so rotating it
+  means a window where either the old or the new secret is rejected: Razorpay
+  signs with whatever their dashboard holds, and this verifies against whatever
+  the process was started with. Accepting two secrets during a rollover is the
+  fix and is not built. In practice a rotation means a brief spike of
+  `webhook_signature_invalid` and redeliveries, which Razorpay's own retries
+  recover once both sides agree — the deliveries are not lost, but they are
+  delayed, and a long enough mismatch outlasts the retry schedule.
 
 - **`API_ACCESS_KEY` is bundled into the frontend's shipped JavaScript by Vite
   at build time**, since `VITE_`-prefixed env vars are inlined into the client

@@ -65,7 +65,8 @@ func newDecisionTestHandler(t *testing.T, decider Decider) (*Handler, *sql.DB, s
 	})
 
 	h := NewHandler(decider, NewPostgresAttemptStore(pool)).
-		WithDecisionRecorder(NewPostgresDecisionStore(pool))
+		WithDecisionRecorder(NewPostgresDecisionStore(pool)).
+		WithVerifier(testVerifier())
 
 	return h, pool, paymentID
 }

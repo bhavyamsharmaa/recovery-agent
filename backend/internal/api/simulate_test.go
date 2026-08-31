@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -38,12 +39,40 @@ func newSimulateHandler(t *testing.T) (*Handler, *countingDecider) {
 	// wired in cmd/server, and this wiring must match it or the test exercises
 	// a shape that does not ship.
 	attempts := ingest.NewPostgresAttemptStore(pool)
+
+	// The webhook verifies signatures in production, and fireWebhook signs with
+	// RAZORPAY_WEBHOOK_SECRET, so the test wiring has to verify against the same
+	// variable — otherwise the simulate endpoints would be exercising a handler
+	// that skips a check the real one performs.
+	//
+	// Only defaulted, never overridden. TestTriggerBatchRunRunsAndStoresARun
+	// shares this helper but drives the batch runner, which posts over real HTTP
+	// to a separately started server: forcing a test-only secret here would sign
+	// with one value while that server verified with another, and every delivery
+	// would be rejected. Defaulting keeps the in-process tests runnable with
+	// only DATABASE_URL set, while an environment that has the real secret is
+	// left alone.
+	if os.Getenv("RAZORPAY_WEBHOOK_SECRET") == "" {
+		t.Setenv("RAZORPAY_WEBHOOK_SECRET", testWebhookSecret)
+	}
+	verifier, err := ingest.NewVerifier()
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+
 	webhook := ingest.NewHandler(&ingest.ForcedFailureDecider{Real: decider}, attempts).
 		WithDecisionRecorder(ingest.NewPostgresDecisionStore(pool)).
-		WithEventStore(ingest.NewPostgresEventStore(pool))
+		WithEventStore(ingest.NewPostgresEventStore(pool)).
+		WithVerifier(verifier)
 
 	return NewHandler(pool).WithWebhook(webhook), decider
 }
+
+// testWebhookSecret is what the simulate endpoints sign with and the test
+// handler verifies against. Declared here rather than shared with the ingest
+// package's constant of the same name, which is unexported: a test secret is
+// not something to widen a package's API for.
+const testWebhookSecret = "api-test-webhook-secret"
 
 // postJSON posts and records every id in the response, so cleanup can delete
 // exactly what the call created.
@@ -267,6 +296,14 @@ func TestWebhookThroughAPIHandlerIsNeverForced(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/webhook/payment-failed", strings.NewReader(body))
 	req.Header.Set("content-type", "application/json")
 	req.Header.Set("x-razorpay-event-id", eventID)
+	// Signed like a real delivery: this test is about the forced-failure marker
+	// not leaking, and an unsigned request would now be rejected before it could
+	// demonstrate anything about that.
+	//
+	// Read from the environment rather than using the constant, because
+	// newSimulateHandler only defaults that variable and leaves a real secret in
+	// place — signing with the constant would fail wherever one is set.
+	req.Header.Set("x-razorpay-signature", ingest.Sign(os.Getenv("RAZORPAY_WEBHOOK_SECRET"), []byte(body)))
 	rec := httptest.NewRecorder()
 	h.webhook.ServeHTTP(rec, req)
 

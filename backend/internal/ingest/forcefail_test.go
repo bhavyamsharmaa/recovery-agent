@@ -142,7 +142,7 @@ func TestForcedFailureMarkerDoesNotLeakAcrossContexts(t *testing.T) {
 // change ever translates one of these into the context marker, this fails.
 func TestWebhookCannotBeForcedToFailByAnyInput(t *testing.T) {
 	real := &countingDecider{decision: confidentDecision()}
-	h := NewHandler(&ForcedFailureDecider{Real: real}, NewInMemoryAttemptStore())
+	h := NewHandler(&ForcedFailureDecider{Real: real}, NewInMemoryAttemptStore()).WithVerifier(testVerifier())
 
 	body := func(id string, extra string) string {
 		return `{"event":"payment.failed",` + extra + `"payload":{"payment":{"entity":{` +
@@ -190,9 +190,15 @@ func TestWebhookCannotBeForcedToFailByAnyInput(t *testing.T) {
 			before := real.calls
 
 			paymentID := "pay_isolation_probe_" + c.name
-			req := httptest.NewRequest(http.MethodPost, c.path, strings.NewReader(body(paymentID, c.extra)))
+			payload := body(paymentID, c.extra)
+			req := httptest.NewRequest(http.MethodPost, c.path, strings.NewReader(payload))
 			req.Header.Set("content-type", "application/json")
 			req.Header.Set(eventIDHeader, "evt_isolation_probe_"+string(rune('a'+i)))
+			// Signed before c.headers is applied, so a probe naming the
+			// signature header can overwrite it — this test exists to show that
+			// no header a caller sends can subvert the handler, and that has to
+			// include this one.
+			req.Header.Set(signatureHeader, Sign(testWebhookSecret, []byte(payload)))
 			for k, v := range c.headers {
 				req.Header.Set(k, v)
 			}
@@ -225,7 +231,7 @@ func TestWebhookCannotBeForcedToFailByAnyInput(t *testing.T) {
 // engage, so both halves of the property are pinned.
 func TestWebhookStillReachesFallbackWhenGenuinelyMarked(t *testing.T) {
 	real := &countingDecider{decision: confidentDecision()}
-	h := NewHandler(&ForcedFailureDecider{Real: real}, NewInMemoryAttemptStore())
+	h := NewHandler(&ForcedFailureDecider{Real: real}, NewInMemoryAttemptStore()).WithVerifier(testVerifier())
 
 	body := `{"event":"payment.failed","payload":{"payment":{"entity":{` +
 		`"id":"pay_marked_probe","amount":50000,"method":"card",` +
@@ -236,6 +242,7 @@ func TestWebhookStillReachesFallbackWhenGenuinelyMarked(t *testing.T) {
 		WithContext(WithForcedDecideFailure(context.Background()))
 	req.Header.Set("content-type", "application/json")
 	req.Header.Set(eventIDHeader, "evt_marked_probe")
+	req.Header.Set(signatureHeader, Sign(testWebhookSecret, []byte(body)))
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)

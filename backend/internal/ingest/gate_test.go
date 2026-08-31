@@ -56,6 +56,10 @@ func fireEvent(t *testing.T, h *Handler, eventID, body string) []map[string]any 
 
 	req := httptest.NewRequest(http.MethodPost, "/webhook/payment-failed", strings.NewReader(body))
 	req.Header.Set(eventIDHeader, eventID)
+	// Signed, because the handler now verifies every delivery. Tests that are
+	// not about signatures still have to send valid ones — there is no bypass,
+	// which is the property signature_test.go's fail-closed case pins.
+	req.Header.Set(signatureHeader, Sign(testWebhookSecret, []byte(body)))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
@@ -96,7 +100,7 @@ func TestConfidenceGateOverridesLowConfidence(t *testing.T) {
 		Confidence:      0.70,
 		Reasoning:       "Funds may have cleared since the first attempt.",
 		CustomerMessage: "We'll automatically retry your payment shortly.",
-	}}, NewInMemoryAttemptStore())
+	}}, NewInMemoryAttemptStore()).WithVerifier(testVerifier())
 
 	lines := fire(t, h, webhookBody("pay_lowconf", "insufficient_funds"))
 
@@ -133,7 +137,7 @@ func TestConfidenceGateLeavesConfidentDecisionAlone(t *testing.T) {
 		Confidence:      0.75, // exactly at the threshold: acted on, not overridden
 		Reasoning:       "First failure, one retry remains.",
 		CustomerMessage: "We'll automatically retry your payment shortly.",
-	}}, NewInMemoryAttemptStore())
+	}}, NewInMemoryAttemptStore()).WithVerifier(testVerifier())
 
 	lines := fire(t, h, webhookBody("pay_confident", "insufficient_funds"))
 
@@ -156,7 +160,7 @@ func TestConfidenceGateAndStoppingRuleAreDistinct(t *testing.T) {
 	h := NewHandler(&stubDecider{decision: decide.Decision{
 		Action:     decide.ActionRetryNow,
 		Confidence: 0.70,
-	}}, NewInMemoryAttemptStore())
+	}}, NewInMemoryAttemptStore()).WithVerifier(testVerifier())
 
 	// hard_decline budgets 0, so the very first delivery trips the stopping rule.
 	lines := fire(t, h, webhookBody("pay_exhausted", "card_declined"))
@@ -188,7 +192,7 @@ func TestConfidenceGateClearsAlternateMethod(t *testing.T) {
 		AlternateMethod: "upi",
 		Reasoning:       "Card has exhausted its retries; another method may work.",
 		CustomerMessage: "Please try paying with UPI instead.",
-	}}, NewInMemoryAttemptStore())
+	}}, NewInMemoryAttemptStore()).WithVerifier(testVerifier())
 
 	lines := fire(t, h, webhookBody("pay_altcleared", "insufficient_funds"))
 
@@ -230,7 +234,7 @@ func TestStoppingRuleHoldsAcrossRepeatedDeliveries(t *testing.T) {
 		Reasoning:       "First failure, one retry remains.",
 		CustomerMessage: "We'll automatically retry your payment shortly.",
 	}}
-	h := NewHandler(decider, NewInMemoryAttemptStore())
+	h := NewHandler(decider, NewInMemoryAttemptStore()).WithVerifier(testVerifier())
 
 	// insufficient_funds budgets 1: delivery 1 is within budget, 2 and 3 are not.
 	body := webhookBody("pay_repeated", "insufficient_funds")
@@ -307,7 +311,7 @@ func TestStoppingRuleIncludesCustomerMessage(t *testing.T) {
 			decider := &stubDecider{decision: decide.Decision{
 				Action: decide.ActionEscalate, Confidence: 0.90,
 			}}
-			h := NewHandler(decider, NewInMemoryAttemptStore())
+			h := NewHandler(decider, NewInMemoryAttemptStore()).WithVerifier(testVerifier())
 
 			lines := fire(t, h, webhookBody("pay_"+tc.name, tc.errorReason))
 

@@ -30,7 +30,7 @@ func (f *failingDecider) Decide(context.Context, decide.DecisionInput) (decide.D
 func TestFallbackAppliedOnDoubleDecisionFailure(t *testing.T) {
 	decideErr := errors.New("decide: unmarshal decision: invalid character '`': format")
 	decider := &failingDecider{err: decideErr}
-	h := NewHandler(decider, NewInMemoryAttemptStore())
+	h := NewHandler(decider, NewInMemoryAttemptStore()).WithVerifier(testVerifier())
 
 	lines := fire(t, h, webhookBody("pay_double_failure", "insufficient_funds"))
 
@@ -77,11 +77,12 @@ func TestFallbackAppliedOnDoubleDecisionFailure(t *testing.T) {
 // non-2xx, so failing the request because the model was unavailable would turn
 // one unanswerable payment into a stream of redeliveries.
 func TestFallbackStillAnswers200(t *testing.T) {
-	h := NewHandler(&failingDecider{err: errors.New("boom")}, NewInMemoryAttemptStore())
+	h := NewHandler(&failingDecider{err: errors.New("boom")}, NewInMemoryAttemptStore()).WithVerifier(testVerifier())
 
 	req := httptest.NewRequest(http.MethodPost, "/webhook/payment-failed",
 		strings.NewReader(webhookBody("pay_status_check", "insufficient_funds")))
 	req.Header.Set(eventIDHeader, "evt_status_check")
+	req.Header.Set(signatureHeader, Sign(testWebhookSecret, []byte(webhookBody("pay_status_check", "insufficient_funds"))))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
@@ -150,7 +151,7 @@ func TestNormalDecisionIsTaggedLLM(t *testing.T) {
 		Confidence:      0.90,
 		Reasoning:       "First failure, one retry remains.",
 		CustomerMessage: "We'll automatically retry your payment shortly.",
-	}}, NewInMemoryAttemptStore())
+	}}, NewInMemoryAttemptStore()).WithVerifier(testVerifier())
 
 	lines := fire(t, h, webhookBody("pay_llm_source", "insufficient_funds"))
 
@@ -168,7 +169,7 @@ func TestNormalDecisionIsTaggedLLM(t *testing.T) {
 // TestStoppingRuleIsTaggedStoppingRule completes the set, so every resolved
 // payment carries exactly one of the three sources.
 func TestStoppingRuleIsTaggedStoppingRule(t *testing.T) {
-	h := NewHandler(&stubDecider{}, NewInMemoryAttemptStore())
+	h := NewHandler(&stubDecider{}, NewInMemoryAttemptStore()).WithVerifier(testVerifier())
 
 	lines := fire(t, h, webhookBody("pay_stop_source", "card_declined"))
 

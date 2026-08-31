@@ -28,7 +28,7 @@ func confidentStub() *stubDecider {
 // again, and only the first one does any work.
 func TestDedupeSameEventIDIsProcessedOnce(t *testing.T) {
 	decider := confidentStub()
-	h := NewHandler(decider, NewInMemoryAttemptStore())
+	h := NewHandler(decider, NewInMemoryAttemptStore()).WithVerifier(testVerifier())
 	body := webhookBody("pay_same_event", "insufficient_funds")
 
 	first := fireEvent(t, h, "evt_fixed", body)
@@ -72,7 +72,7 @@ func TestDedupeSameEventIDIsProcessedOnce(t *testing.T) {
 func TestDedupeDifferentEventIDsSamePaymentAreBothNew(t *testing.T) {
 	decider := confidentStub()
 	store := NewInMemoryAttemptStore()
-	h := NewHandler(decider, store)
+	h := NewHandler(decider, store).WithVerifier(testVerifier())
 
 	// soft_decline budgets 2, so both deliveries stay within budget and reach the
 	// decision layer. Using a category that stopped on delivery 2 would make a
@@ -119,7 +119,7 @@ func TestDedupeConcurrentSameEventID(t *testing.T) {
 	const n = 20
 
 	decider := confidentStub()
-	h := NewHandler(decider, NewInMemoryAttemptStore())
+	h := NewHandler(decider, NewInMemoryAttemptStore()).WithVerifier(testVerifier())
 	body := webhookBody("pay_concurrent", "insufficient_funds")
 
 	out := &syncBuffer{}
@@ -136,6 +136,7 @@ func TestDedupeConcurrentSameEventID(t *testing.T) {
 			<-start // release together, to maximise the window the race needs
 			req := httptest.NewRequest(http.MethodPost, "/webhook/payment-failed", strings.NewReader(body))
 			req.Header.Set(eventIDHeader, "evt_concurrent")
+			req.Header.Set(signatureHeader, Sign(testWebhookSecret, []byte(body)))
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, req)
 			if rec.Code != http.StatusOK {
