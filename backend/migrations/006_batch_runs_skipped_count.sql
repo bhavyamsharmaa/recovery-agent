@@ -1,0 +1,28 @@
+-- How many of a batch's payments could not be scored at all.
+--
+-- A payment is skipped when the webhook post fails to connect, answers non-2xx,
+-- cannot be read back, or produced no decision. The run loop counts it and
+-- continues, deliberately: one unreachable payment should not discard the
+-- ninety-nine that worked. What was missing is any record that it happened.
+--
+-- Issue #3: the dashboard's batch-run path never set Options.URL, so it fell
+-- back to a hardcoded localhost:8080 that a deployed instance does not listen
+-- on. Every one of 100 payments failed to connect, every one was skipped, and
+-- the run stored total_at_risk_paise = 0 alongside a real completed_at and
+-- returned HTTP 200. Three such runs sat in production looking like genuine
+-- results that happened to recover nothing.
+--
+-- The financial columns cannot carry that distinction. A run that scored
+-- nothing and a run that scored nothing *because it never reached a single
+-- payment* both write zeros, and zero is a legitimate figure. Only a count of
+-- what was skipped separates them, and only if it is on the row: the skip
+-- reasons live in logs that rotate, and there is no foreign key from outcomes
+-- to batch_runs to reconstruct it from afterwards.
+--
+-- Nullable, like every other result column, and for the same reason: it is
+-- unknown until the run completes. NULL means "this run never finished", 0
+-- means "it finished and every payment was scored". Those are different claims
+-- and the schema keeps them apart, as it does for NULL-versus-0 confidence and
+-- a missing-versus-failed outcome.
+ALTER TABLE batch_runs
+    ADD COLUMN IF NOT EXISTS skipped_count INT;

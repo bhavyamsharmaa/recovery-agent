@@ -152,7 +152,21 @@ func main() {
 	// The webhook registered above is deliberately outside this. Razorpay
 	// cannot send our header, and that endpoint's authenticity problem is
 	// signature verification, which this secret does not solve.
-	guarded, err := api.NewAuth(api.NewHandler(pool).WithWebhook(handler))
+	// NewHandlerWithBatchURL rather than NewHandler: a triggered batch posts to
+	// this instance's own webhook over HTTP, and the server cannot work out its
+	// own external address — the port it binds is not the port it is reached on,
+	// and behind a proxy neither is the scheme or host. PUBLIC_BASE_URL supplies
+	// it, and an unset value is fatal here for the same reason the other secrets
+	// are: issue #3 was a deployed instance falling back to localhost:8080,
+	// failing every payment in a batch, and storing zeros beside a real
+	// completed_at while answering 200.
+	apiHandler, err := api.NewHandlerWithBatchURL(pool)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	guarded, err := api.NewAuth(apiHandler.WithWebhook(handler))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

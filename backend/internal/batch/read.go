@@ -39,18 +39,34 @@ type StoredRun struct {
 	// that completed with every payment reaching the model. Those are different
 	// statements and stay distinguishable.
 	FallbackDecisions sql.NullInt64
+
+	// SkippedCount is how many payments could not be scored at all — the post
+	// failed, answered non-2xx, could not be read back, or produced no decision.
+	//
+	// A run with a non-zero count here scored fewer payments than its
+	// batch_size, so its figures describe a smaller batch than the row claims to
+	// have run. Without this the two are indistinguishable in the data: issue #3
+	// stored zeros for every financial column on runs where nothing was ever
+	// delivered, beside a real completed_at.
+	//
+	// NULL for a run that never completed, 0 for one where every payment was
+	// scored. Rows written before migration 006 are NULL, which is honest —
+	// their skip count was never recorded and is not recoverable.
+	SkippedCount sql.NullInt64
 }
 
 const runColumns = `
 	id, started_at, completed_at, batch_size, rng_seed,
 	total_at_risk_paise, total_recovered_paise, recovery_rate,
-	baseline_recovered_paise, baseline_recovery_rate, fallback_decisions`
+	baseline_recovered_paise, baseline_recovery_rate, fallback_decisions,
+	skipped_count`
 
 func scanRun(s interface{ Scan(...any) error }) (StoredRun, error) {
 	var r StoredRun
 	err := s.Scan(&r.ID, &r.StartedAt, &r.CompletedAt, &r.BatchSize, &r.RNGSeed,
 		&r.TotalAtRiskPaise, &r.TotalRecoveredPaise, &r.RecoveryRate,
-		&r.BaselineRecoveredPaise, &r.BaselineRecoveryRate, &r.FallbackDecisions)
+		&r.BaselineRecoveredPaise, &r.BaselineRecoveryRate, &r.FallbackDecisions,
+		&r.SkippedCount)
 	return r, err
 }
 

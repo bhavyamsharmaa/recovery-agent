@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/bhavyamsharmaa/recovery-agent/internal/trace"
@@ -53,6 +54,12 @@ type Handler struct {
 	// interleave through one attempt counter and produce figures that describe
 	// nothing reproducible.
 	batch batchRunner
+
+	// webhookURL is where a triggered batch posts its simulated failures: this
+	// instance's own webhook endpoint, built from PUBLIC_BASE_URL. Empty when
+	// that is unset, which only NewHandler permits — cmd/server goes through
+	// NewHandlerWithBatchURL and refuses to start instead. See batch.go.
+	webhookURL string
 
 	// webhook is the real ingest handler, used by the /api/simulate/ routes to
 	// dispatch a delivery in-process. Nil unless WithWebhook is called, and the
@@ -107,6 +114,31 @@ func NewHandler(db *sql.DB) *Handler {
 	h.mux.HandleFunc("POST /api/simulate/duplicate", h.simulateDuplicate)
 	h.mux.HandleFunc("POST /api/simulate/llm-failure", h.simulateLLMFailure)
 	return h
+}
+
+// NewHandlerWithBatchURL is NewHandler plus the batch webhook URL, read from
+// PUBLIC_BASE_URL. It returns an error when that is unset, so the process can
+// refuse to start rather than serving a batch endpoint that cannot work.
+//
+// Fail-fast rather than falling back, because the fallback is what caused issue
+// #3: batch.DefaultWebhookURL is localhost:8080, which is silently wrong on any
+// deployed instance and produced three runs that recorded zeros while returning
+// 200. A missing address should stop the server, not produce results that look
+// real.
+//
+// It is a second constructor rather than a changed signature so every existing
+// caller and test keeps NewHandler. Those get an empty webhookURL and are
+// refused at request time by triggerBatchRun — the batch endpoint does not work
+// without configuration, but the read API built beside it still does.
+func NewHandlerWithBatchURL(db *sql.DB) (*Handler, error) {
+	base := strings.TrimRight(os.Getenv(publicBaseURLEnv), "/")
+	if base == "" {
+		return nil, fmt.Errorf("%s is not set: a batch posts to this instance's own webhook and cannot guess its address", publicBaseURLEnv)
+	}
+
+	h := NewHandler(db)
+	h.webhookURL = base + webhookPath
+	return h, nil
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {

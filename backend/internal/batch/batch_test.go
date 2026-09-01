@@ -4,9 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -377,10 +380,21 @@ func TestRunSkipsUnscorablePayments(t *testing.T) {
 	}
 }
 
-// TestRunWithNothingScorableReportsZeroRatesNotNaN is the division-by-zero
-// case. Every payment failing to score leaves at-risk at 0, and 0/0 in Go is
-// NaN — which would be stored as a rate and rendered on the dashboard.
-func TestRunWithNothingScorableReportsZeroRatesNotNaN(t *testing.T) {
+// TestRunWithNothingScorableFailsLoudly is the issue #3 case.
+//
+// This test previously asserted the opposite — that a run scoring nothing
+// completed cleanly with zero rates — and that assertion was the bug written
+// down as a guarantee. A run where every payment was skipped stored zeros
+// beside a real completed_at and answered 200, so three deployed runs looked
+// like genuine results that recovered nothing. Zero recovered and never
+// attempted are different claims, and only one of them is about the routing
+// policy.
+//
+// The NaN concern the old test existed for has not gone away; it moved to
+// TestRunWithZeroAmountsDoesNotProduceNaN below, where a payment IS scored and
+// the denominator is still zero. That is now the only way to reach the
+// division, and the guard is still what prevents it.
+func TestRunWithNothingScorableFailsLoudly(t *testing.T) {
 	pool := liveDB(t)
 	var seen []string
 
@@ -395,25 +409,240 @@ func TestRunWithNothingScorableReportsZeroRatesNotNaN(t *testing.T) {
 
 	res, err := Run(context.Background(), pool, Options{Size: 3, Seed: 9, URL: srv.URL})
 	cleanupRun(t, pool, res.ID, &seen)
-	if err != nil {
-		t.Fatalf("Run: %v", err)
+
+	if err == nil {
+		t.Fatal("Run returned no error with every payment skipped; this is exactly issue #3 — " +
+			"a run that reached nothing must not look like a run that recovered nothing")
+	}
+	if !errors.Is(err, ErrAllSkipped) {
+		t.Errorf("error = %v, want one wrapping ErrAllSkipped so callers can distinguish it", err)
 	}
 
-	if res.Skipped != 3 || res.TotalAtRiskPaise != 0 {
-		t.Fatalf("expected all 3 skipped and 0 at risk, got Skipped=%d atRisk=%d",
-			res.Skipped, res.TotalAtRiskPaise)
+	// The error has to be actionable. The URL is the field that was wrong in
+	// issue #3 and is almost always the cause, so it belongs in the message.
+	if !strings.Contains(err.Error(), srv.URL) {
+		t.Errorf("error does not name the URL that failed: %v", err)
 	}
-	if res.RecoveryRate != 0 || res.BaselineRecoveryRate != 0 {
-		t.Errorf("rates = %v / %v, want 0 / 0 — 0/0 must not become NaN",
-			res.RecoveryRate, res.BaselineRecoveryRate)
+
+	if res.Skipped != 3 {
+		t.Errorf("Skipped = %d, want 3", res.Skipped)
+	}
+
+	// The row keeps NULL completed_at — the state that already means "started
+	// and never finished", which is what happened. Stamping it complete with
+	// zeros is the thing being fixed.
+	stored := readRun(t, pool, res.ID)
+	if stored.CompletedAt.Valid {
+		t.Errorf("completed_at = %v, want NULL — a run that scored nothing did not complete",
+			stored.CompletedAt.Time)
+	}
+	if stored.TotalAtRiskPaise.Valid {
+		t.Errorf("total_at_risk_paise = %d, want NULL rather than a figure claiming a result",
+			stored.TotalAtRiskPaise.Int64)
+	}
+}
+
+// TestRunWithZeroAmountsDoesNotProduceNaN keeps the division-by-zero guarantee
+// the test above used to carry.
+//
+// With all-skipped runs now failing, the only remaining route to a zero
+// denominator is payments that ARE scored and happen to total zero. 0/0 in Go
+// is NaN, which would be stored as a rate and rendered on the dashboard, so the
+// guard in Run stays load-bearing even though its original caller is gone.
+func TestRunWithZeroAmountsDoesNotProduceNaN(t *testing.T) {
+	pool := liveDB(t)
+	var seen []string
+
+	stub := &stubWebhook{
+		t: t, pool: pool, seen: &seen,
+		amountFor: func(int) int64 { return 0 }, // scored, but worth nothing
+		actionFor: func(int) string { return "retry_now" },
+		statusFor: func(int) int { return http.StatusOK },
+	}
+	srv := httptest.NewServer(stub)
+	defer srv.Close()
+
+	res, err := Run(context.Background(), pool, Options{Size: 3, Seed: 11, URL: srv.URL})
+	cleanupRun(t, pool, res.ID, &seen)
+	if err != nil {
+		t.Fatalf("Run: %v — payments were scored, so this must not fail", err)
+	}
+
+	if res.Skipped != 0 {
+		t.Fatalf("Skipped = %d, want 0 — every payment was delivered and decided", res.Skipped)
+	}
+	if res.TotalAtRiskPaise != 0 {
+		t.Fatalf("TotalAtRiskPaise = %d, want 0 for this setup", res.TotalAtRiskPaise)
 	}
 	if isNaN(res.RecoveryRate) || isNaN(res.BaselineRecoveryRate) {
 		t.Error("a rate is NaN; it would be stored and rendered as one")
 	}
+	if res.RecoveryRate != 0 || res.BaselineRecoveryRate != 0 {
+		t.Errorf("rates = %v / %v, want 0 / 0", res.RecoveryRate, res.BaselineRecoveryRate)
+	}
 
 	stored := readRun(t, pool, res.ID)
+	if !stored.CompletedAt.Valid {
+		t.Error("a run that scored every payment must complete, whatever the amounts were")
+	}
 	if stored.RecoveryRate.Float64 != 0 {
 		t.Errorf("stored recovery_rate = %v, want 0", stored.RecoveryRate.Float64)
+	}
+}
+
+// TestUnreachableURLFailsLoudly reproduces issue #3's actual condition: not a
+// server answering badly, but no server at all — which is what
+// batch.DefaultWebhookURL pointed at on every deployed instance.
+//
+// The old behaviour was a run that finished in milliseconds, stored zeros, and
+// returned nil. This asserts the whole shape of the fix at once: an error, no
+// completed_at, and a message naming the address nothing was listening on.
+func TestUnreachableURLFailsLoudly(t *testing.T) {
+	pool := liveDB(t)
+
+	// A port nothing is listening on. Bound and immediately released, so the
+	// number is real and free rather than guessed.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	dead := "http://" + l.Addr().String() + "/webhook/payment-failed"
+	l.Close()
+
+	var reasons []string
+	res, err := Run(context.Background(), pool, Options{
+		Size: 5, Seed: 777, URL: dead,
+		Skipped: func(_ int, _, reason string) { reasons = append(reasons, reason) },
+	})
+	var seen []string
+	cleanupRun(t, pool, res.ID, &seen)
+
+	if err == nil {
+		t.Fatal("a batch posting to an unreachable URL returned no error — " +
+			"this is the exact silent failure issue #3 describes")
+	}
+	if !errors.Is(err, ErrAllSkipped) {
+		t.Errorf("error = %v, want one wrapping ErrAllSkipped", err)
+	}
+	if !strings.Contains(err.Error(), dead) {
+		t.Errorf("error does not name the unreachable URL: %v", err)
+	}
+
+	// Every skip reason was reported, and each names the connection failure.
+	// These are the lines the HTTP path used to discard.
+	if len(reasons) != 5 {
+		t.Errorf("Skipped callback fired %d times, want 5", len(reasons))
+	}
+	for _, r := range reasons {
+		if !strings.Contains(r, "send failed") {
+			t.Errorf("skip reason does not name the send failure: %q", r)
+		}
+	}
+
+	stored := readRun(t, pool, res.ID)
+	if stored.CompletedAt.Valid {
+		t.Error("completed_at was stamped on a run that reached no payments")
+	}
+}
+
+// TestPartialSkipPersistsSkippedCount covers the other half: a run that skipped
+// some payments still completes, and the count is durable.
+//
+// The figures such a run stores are real but describe a smaller batch than
+// batch_size claims. Before migration 006 nothing in the row said so, and the
+// only record was a log line the HTTP path never wrote.
+func TestPartialSkipPersistsSkippedCount(t *testing.T) {
+	pool := liveDB(t)
+	var seen []string
+
+	// Indexes 1 and 3 fail; 0, 2 and 4 are scored at 300000 paise each.
+	stub := &stubWebhook{
+		t: t, pool: pool, seen: &seen,
+		amountFor: func(int) int64 { return 300000 },
+		actionFor: func(int) string { return "retry_now" },
+		statusFor: func(i int) int {
+			if i == 1 || i == 3 {
+				return http.StatusInternalServerError
+			}
+			return http.StatusOK
+		},
+	}
+	srv := httptest.NewServer(stub)
+	defer srv.Close()
+
+	res, err := Run(context.Background(), pool, Options{Size: 5, Seed: 5150, URL: srv.URL})
+	cleanupRun(t, pool, res.ID, &seen)
+	if err != nil {
+		t.Fatalf("Run: %v — a partially skipped run must still complete", err)
+	}
+
+	if res.Skipped != 2 {
+		t.Fatalf("Skipped = %d, want 2", res.Skipped)
+	}
+
+	stored := readRun(t, pool, res.ID)
+	if !stored.CompletedAt.Valid {
+		t.Error("a partially skipped run must still complete: 3 payments were genuinely scored")
+	}
+	if !stored.SkippedCount.Valid {
+		t.Fatal("skipped_count is NULL on a completed run; a partial skip must be visible in the data")
+	}
+	if stored.SkippedCount.Int64 != 2 {
+		t.Errorf("stored skipped_count = %d, want 2", stored.SkippedCount.Int64)
+	}
+
+	// batch_size still records what was asked for, so the pair (batch_size=5,
+	// skipped_count=2) says three were scored without a reader having to guess.
+	if stored.BatchSize != 5 {
+		t.Errorf("batch_size = %d, want 5", stored.BatchSize)
+	}
+
+	// The rate is over the three scored payments only — 900000 paise, not
+	// 1500000. A skipped payment must not dilute the denominator, which is the
+	// existing behaviour and must survive the new column.
+	if want := int64(900000); stored.TotalAtRiskPaise.Int64 != want {
+		t.Errorf("stored total_at_risk_paise = %d, want %d — skipped payments must stay out of the denominator",
+			stored.TotalAtRiskPaise.Int64, want)
+	}
+	if isNaN(stored.RecoveryRate.Float64) {
+		t.Error("stored recovery_rate is NaN")
+	}
+	// Every scored payment recovered or did not, but the rate must be a real
+	// fraction of the scored total rather than of the full batch.
+	if stored.RecoveryRate.Float64 < 0 || stored.RecoveryRate.Float64 > 1 {
+		t.Errorf("stored recovery_rate = %v, want a fraction in [0,1] over the scored payments",
+			stored.RecoveryRate.Float64)
+	}
+}
+
+// A completed run with no skips records 0, not NULL. The two are different
+// claims — "every payment scored" versus "we never found out" — and the schema
+// keeps them apart the way it does for confidence and outcomes.
+func TestNoSkipsPersistsZeroNotNull(t *testing.T) {
+	pool := liveDB(t)
+	var seen []string
+
+	stub := &stubWebhook{
+		t: t, pool: pool, seen: &seen,
+		amountFor: func(int) int64 { return 100000 },
+		actionFor: func(int) string { return "retry_now" },
+		statusFor: func(int) int { return http.StatusOK },
+	}
+	srv := httptest.NewServer(stub)
+	defer srv.Close()
+
+	res, err := Run(context.Background(), pool, Options{Size: 3, Seed: 606, URL: srv.URL})
+	cleanupRun(t, pool, res.ID, &seen)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	stored := readRun(t, pool, res.ID)
+	if !stored.SkippedCount.Valid {
+		t.Fatal("skipped_count is NULL on a clean completed run; 0 is the answer, not unknown")
+	}
+	if stored.SkippedCount.Int64 != 0 {
+		t.Errorf("stored skipped_count = %d, want 0", stored.SkippedCount.Int64)
 	}
 }
 
