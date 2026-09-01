@@ -65,7 +65,21 @@ func newSimulateHandler(t *testing.T) (*Handler, *countingDecider) {
 		WithEventStore(ingest.NewPostgresEventStore(pool)).
 		WithVerifier(verifier)
 
-	return NewHandler(pool).WithWebhook(webhook), decider
+	// PUBLIC_BASE_URL is what triggerBatchRun builds its webhook address from
+	// (issue #3). TestTriggerBatchRunRunsAndStoresARun shares this helper and
+	// drives a real batch, which posts over HTTP to a separately started server
+	// on 8080 — so that is the address it needs. Defaulted rather than forced,
+	// like the webhook secret above, so an environment that already points
+	// somewhere else is left alone.
+	if os.Getenv(publicBaseURLEnv) == "" {
+		t.Setenv(publicBaseURLEnv, "http://localhost:8080")
+	}
+	api, err := NewHandlerWithBatchURL(pool)
+	if err != nil {
+		t.Fatalf("NewHandlerWithBatchURL: %v", err)
+	}
+
+	return api.WithWebhook(webhook), decider
 }
 
 // testWebhookSecret is what the simulate endpoints sign with and the test

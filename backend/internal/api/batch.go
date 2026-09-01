@@ -5,7 +5,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -28,6 +31,26 @@ const defaultTriggeredBatchSize = 20
 // unauthenticated caller — and these routes are unauthenticated — could ask for
 // a million payments and spend real model budget doing it.
 const maxTriggeredBatchSize = 200
+
+// publicBaseURLEnv names the variable holding this instance's own externally
+// reachable base URL, e.g. https://recovery-agent-mcyz.onrender.com.
+//
+// A batch posts its simulated failures to the webhook over HTTP rather than
+// calling the handler in-process, deliberately: that is what makes it exercise
+// the same path Razorpay hits. The consequence is that the run needs an address
+// for this very server, and the server cannot work one out for itself — the
+// port it binds is not necessarily the port it is reached on, and behind a
+// proxy the scheme and host are not its own either.
+//
+// Issue #3: without this the API path fell back to batch.DefaultWebhookURL,
+// which is localhost:8080. A deployed instance binds $PORT, so every payment
+// failed to connect and the run stored zeros beside a real completed_at.
+const publicBaseURLEnv = "PUBLIC_BASE_URL"
+
+// webhookPath is appended to the public base URL. It matches the route
+// registered in cmd/server, and the two must stay in step — a batch posting to
+// a path nothing serves would 404 every payment and skip the lot.
+const webhookPath = "/webhook/payment-failed"
 
 // batchRunner serialises triggered runs.
 //
@@ -58,6 +81,53 @@ func (r *batchRunner) release() {
 	r.mu.Unlock()
 }
 
+// batchSkippedLog records one payment a batch could not score.
+//
+// These are the lines issue #3 discarded. The HTTP path collected the reasons
+// through Options.Skipped and passed no callback, so a hundred identical
+// "connection refused" messages naming the exact cause were dropped while the
+// run reported success. The URL is on every line because it is the field that
+// was wrong.
+//
+// Shaped like ingest's log structs — an event name, the facts, a timestamp —
+// so one JSON log stream covers the whole pipeline.
+type batchSkippedLog struct {
+	Event     string `json:"event"`
+	Index     int    `json:"index"`
+	Size      int    `json:"size"`
+	PaymentID string `json:"payment_id"`
+	URL       string `json:"url"`
+	Reason    string `json:"reason"`
+	TS        string `json:"ts"`
+}
+
+// batchPartialLog records a completed run that scored fewer payments than it
+// set out to. The figures it stored are real but describe a smaller batch than
+// batch_size claims, and skipped_count on the row is the durable version of
+// this line.
+type batchPartialLog struct {
+	Event   string `json:"event"`
+	RunID   int64  `json:"run_id"`
+	Skipped int    `json:"skipped"`
+	Scored  int    `json:"scored"`
+	Size    int    `json:"size"`
+	TS      string `json:"ts"`
+}
+
+// logOut is where this package's structured log lines go. A package var rather
+// than os.Stdout inline so tests can capture them; production never reassigns
+// it. Mirrors ingest.logOut.
+var logOut io.Writer = os.Stdout
+
+func logLine(v any) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "could not marshal log line: %v\n", err)
+		return
+	}
+	fmt.Fprintln(logOut, string(b))
+}
+
 // batchRunJSON is one batch_runs row on the wire.
 //
 // The result fields are pointers because the columns are nullable: a run that
@@ -85,6 +155,15 @@ type batchRunJSON struct {
 	// meaning every payment reached the model.
 	FallbackDecisions *int `json:"fallback_decisions"`
 
+	// SkippedCount is how many payments could not be scored at all. A non-zero
+	// value means the figures below describe fewer payments than batch_size,
+	// and a consumer showing those figures should say so — the dashboard warning
+	// is not built yet, and this field is what it will read.
+	//
+	// Null for a run that never completed and for any run predating migration
+	// 006, whose skip count was never recorded; 0 means every payment scored.
+	SkippedCount *int `json:"skipped_count"`
+
 	// ImprovementPoints is recovery_rate - baseline_recovery_rate, in percentage
 	// points, computed here rather than in the browser. It is the headline
 	// number of the whole feature, and two clients deriving it independently is
@@ -104,6 +183,7 @@ func toBatchRunJSON(r batch.StoredRun) batchRunJSON {
 		BaselineRecoveredPaise: nullInt(r.BaselineRecoveredPaise),
 		BaselineRecoveryRate:   nullFloat(r.BaselineRecoveryRate),
 		FallbackDecisions:      nullIntAsInt(r.FallbackDecisions),
+		SkippedCount:           nullIntAsInt(r.SkippedCount),
 	}
 	if r.CompletedAt.Valid {
 		t := jsonTime(r.CompletedAt.Time)
@@ -162,12 +242,13 @@ func (h *Handler) listBatchRuns(w http.ResponseWriter, r *http.Request) {
 
 // triggerBatchRun serves POST /api/batch-runs.
 //
-// THIS IS THE ONE ENDPOINT THAT IS NOT READ-ONLY. It writes outcomes and
-// batch_runs rows and spends real model budget, and like every route here it is
-// unauthenticated — so anyone who can reach the port can make this server work.
-// The size cap and the single-run lock below are the only things standing
-// between that and an unbounded bill. They are a mitigation, not a substitute
-// for the authentication this API still needs before it goes anywhere real.
+// This endpoint writes outcomes and batch_runs rows and spends real model
+// budget. It is behind the shared-secret gate in auth.go along with every other
+// route here, and the size cap and single-run lock below bound what one
+// authorised caller can spend in a single request.
+//
+// It also needs PUBLIC_BASE_URL, because a batch posts to this instance's own
+// webhook over HTTP. See publicBaseURLEnv.
 func (h *Handler) triggerBatchRun(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Size int   `json:"size"`
@@ -206,10 +287,74 @@ func (h *Handler) triggerBatchRun(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), batchRunTimeout)
 	defer cancel()
 
-	res, err := batch.Run(ctx, h.db, batch.Options{Size: req.Size, Seed: req.Seed})
+	// Configuration is checked here rather than at the top of the function so a
+	// misconfigured instance still serves every read route. A 503 names the
+	// variable: the alternative is a run that posts nowhere, which is exactly
+	// what issue #3 was.
+	if h.webhookURL == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "batch runs are not configured: " + publicBaseURLEnv + " is unset",
+		})
+		return
+	}
+
+	res, err := batch.Run(ctx, h.db, batch.Options{
+		Size: req.Size,
+		Seed: req.Seed,
+
+		// The instance's own address, not the package default. This one line is
+		// the fix for issue #3.
+		URL: h.webhookURL,
+
+		// Every skip reason, as a structured line on stdout with the rest of the
+		// pipeline's logs. The CLI wires this to stderr and that is how the bug
+		// stayed invisible here: the HTTP path collected the reasons and dropped
+		// them, so 100 identical "connection refused" messages — which named the
+		// cause outright — were never written anywhere.
+		// No run id on this line: the callback fires during the call that
+		// produces it, so it is not available yet. The payment id and the
+		// timestamp locate the line, and the partial/failure line below carries
+		// the id once there is one.
+		Skipped: func(i int, paymentID, reason string) {
+			logLine(batchSkippedLog{
+				Event:     "batch_payment_skipped",
+				Index:     i,
+				Size:      req.Size,
+				PaymentID: paymentID,
+				URL:       h.webhookURL,
+				Reason:    reason,
+				TS:        time.Now().UTC().Format(time.RFC3339),
+			})
+		},
+	})
+
+	// A run where nothing could be delivered is a failure, not a result. The
+	// batch_runs row keeps its NULL completed_at and the caller gets an error
+	// naming the URL — rather than a 200 carrying zeros, which is how this
+	// looked for three production runs before issue #3 was found.
+	if errors.Is(err, batch.ErrAllSkipped) {
+		h.fail(w, r, http.StatusBadGateway, "batch run reached no payments: "+err.Error(), err)
+		return
+	}
 	if err != nil {
 		h.fail(w, r, http.StatusInternalServerError, "batch run failed", err)
 		return
+	}
+
+	// A partially skipped run still has real figures over what it did score, so
+	// it is returned rather than failed — but it is logged, because a run that
+	// silently scored fewer payments than it claims is the shape of the next
+	// bug like #3. skipped_count on the row is the durable record; this is the
+	// line that gets noticed.
+	if res.Skipped > 0 {
+		logLine(batchPartialLog{
+			Event:   "batch_run_partially_skipped",
+			RunID:   res.ID,
+			Skipped: res.Skipped,
+			Size:    res.Size,
+			Scored:  res.Size - res.Skipped,
+			TS:      time.Now().UTC().Format(time.RFC3339),
+		})
 	}
 
 	// Read the row back rather than reshaping the in-memory result, so what the

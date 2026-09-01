@@ -327,6 +327,47 @@ those, which is accurate rather than a gap.
   gate's job is to stop casual/automated discovery of an open port, not to
   resist a deliberate user of the dashboard itself.
 
+- **A triggered batch posts to itself over HTTP, so it needs `PUBLIC_BASE_URL`
+  (found in production, fixed).** `POST /api/batch-runs` never set
+  `Options.URL`, so it fell back to `batch.DefaultWebhookURL` —
+  `http://localhost:8080/webhook/payment-failed`. That is correct for
+  `cmd/run-batch` against a local server and wrong on any deployed instance,
+  which binds `$PORT`. Every payment failed to connect, every one was counted as
+  skipped, and the run stored zeros for every financial column **beside a real
+  `completed_at`, answering HTTP 200**. Three such runs sat in production
+  rendering as a genuine 0.0% result. See
+  [issue #3](https://github.com/bhavyamsharmaa/recovery-agent/issues/3).
+
+  The tell was the duration: run 302 started and completed 203ms apart for a
+  claimed 100 payments, where a real run takes minutes. Nothing else
+  distinguished it — which is the point.
+
+  Three changes, because the URL alone would only fix this instance of it:
+
+  1. The API path passes `PUBLIC_BASE_URL` + `/webhook/payment-failed`, and the
+     server **refuses to start** when that is unset. A batch cannot work out its
+     own external address: the port it binds is not necessarily the port it is
+     reached on, and behind a proxy neither is the scheme or host.
+  2. A run where **every** payment was skipped now returns `ErrAllSkipped`
+     rather than completing. Its row keeps `completed_at` NULL — the state that
+     already meant "started and never finished". Zero recovered and never
+     attempted are different claims, and only the first is about the routing
+     policy. A **partially** skipped run still completes: failing it would
+     discard ninety-nine good observations because one payment was unreachable.
+  3. `skipped_count` (migration 006) makes any future skip visible in the data.
+     Logs rotate, and there is no foreign key from `outcomes` to `batch_runs` to
+     reconstruct it afterwards.
+
+  The skip reasons were always collected through `Options.Skipped` — and the
+  HTTP path passed no callback, so a hundred identical "connection refused"
+  messages naming the exact cause were discarded. The CLI wired it to stderr,
+  which is why every local rehearsal looked fine. Both paths now report.
+
+  Rows written before migration 006 have `skipped_count` NULL, which is honest:
+  their skip count was never recorded and cannot be recovered. Runs 301 and 302
+  therefore still show zeros with a NULL count — the evidence of the bug is left
+  in place rather than backfilled with a guess.
+
 - **The listen port comes from `PORT`, defaulting to 8080.** It was hardcoded,
   which fails on any host that assigns a port dynamically: the process binds
   somewhere the platform is not routing to, then fails a health check while its

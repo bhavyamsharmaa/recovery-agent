@@ -32,6 +32,7 @@ package batch
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math/rand"
 	"time"
@@ -43,11 +44,33 @@ import (
 
 const dbTimeout = 30 * time.Second
 
-// DefaultWebhookURL is where a batch posts its simulated failures. It is the
-// server's own webhook endpoint: a batch triggered from the API loops back
-// through the full HTTP path rather than calling the handler in-process, so the
-// batch exercises exactly what Razorpay would hit.
+// DefaultWebhookURL is where a batch posts its simulated failures when the
+// caller does not say. It is the server's own webhook endpoint: a batch loops
+// back through the full HTTP path rather than calling the handler in-process,
+// so the batch exercises exactly what Razorpay would hit.
+//
+// It is a LOCAL default and nothing else. It is correct for cmd/run-batch
+// against a local server and wrong on every deployed instance, which binds
+// $PORT rather than 8080. The API path must pass its own configured URL and no
+// longer relies on this — see issue #3, where relying on it made every payment
+// in a deployed run fail to connect.
 const DefaultWebhookURL = "http://localhost:8080/webhook/payment-failed"
+
+// ErrAllSkipped reports that a run reached the end without scoring a single
+// payment.
+//
+// This is an error rather than a zero-valued result because the two are not the
+// same claim. A run that scored nothing has no rupee figures to report, and
+// storing 0 for each of them says "this batch recovered nothing", which reads
+// as a finding about the routing policy. The truth is that the batch never got
+// far enough to have a finding — and in issue #3 that difference was invisible
+// for three production runs, which recorded a real completed_at, returned 200,
+// and rendered as 0.0%.
+//
+// Only the all-skipped case is fatal. A partially skipped run has genuine
+// figures over the payments it did score, and failing it would discard
+// ninety-nine good observations because one payment could not be reached.
+var ErrAllSkipped = errors.New("batch: every payment was skipped; no figures were produced")
 
 // Options configures one run.
 type Options struct {
@@ -226,10 +249,30 @@ func Run(ctx context.Context, pool *sql.DB, opts Options) (Result, error) {
 		}
 	}
 
+	// Nothing was scored at all. The run is failed rather than completed, and
+	// the row keeps its NULL completed_at — the state that already means
+	// "started and never finished", which is exactly what happened.
+	//
+	// Writing zeros here is what issue #3 did, and it is worse than useless: it
+	// claims the routing policy recovered nothing, when the truth is that no
+	// payment ever reached the pipeline. The caller gets an error naming the
+	// count and the URL, because the URL is almost always the reason — a batch
+	// posts to itself over HTTP, so an unreachable address fails every payment
+	// identically and instantly.
+	if res.Skipped == opts.Size {
+		return res, fmt.Errorf("%w: %d of %d payments could not be delivered to %s",
+			ErrAllSkipped, res.Skipped, opts.Size, opts.URL)
+	}
+
 	// Rates are computed against money at risk, not against payment count, and
 	// only over the payments actually scored. A run where some payments were
 	// skipped would otherwise report a rate diluted by payments it never ruled
 	// on.
+	//
+	// The guard stays even though the all-skipped case above now returns early:
+	// a payment can be scored with a zero amount, so a non-empty batch can still
+	// total zero at risk, and dividing by it would produce NaN rather than an
+	// error anyone would notice.
 	if res.TotalAtRiskPaise > 0 {
 		res.RecoveryRate = float64(res.TotalRecoveredPaise) / float64(res.TotalAtRiskPaise)
 		res.BaselineRecoveryRate = float64(res.BaselineRecoveredPaise) / float64(res.TotalAtRiskPaise)
@@ -320,10 +363,12 @@ func finishRun(ctx context.Context, pool *sql.DB, res Result) error {
 		    recovery_rate = $4,
 		    baseline_recovered_paise = $5,
 		    baseline_recovery_rate = $6,
-		    fallback_decisions = $7
+		    fallback_decisions = $7,
+		    skipped_count = $8
 		WHERE id = $1`,
 		res.ID, res.TotalAtRiskPaise, res.TotalRecoveredPaise, res.RecoveryRate,
-		res.BaselineRecoveredPaise, res.BaselineRecoveryRate, res.FallbackDecisions); err != nil {
+		res.BaselineRecoveredPaise, res.BaselineRecoveryRate, res.FallbackDecisions,
+		res.Skipped); err != nil {
 		return fmt.Errorf("batch: finish run: %w", err)
 	}
 	return nil
