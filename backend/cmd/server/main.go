@@ -112,6 +112,30 @@ func main() {
 		WithVerifier(verifier)
 	http.Handle("/webhook/payment-failed", handler)
 
+	// The health check, for the platform rather than for a person.
+	//
+	// Unauthenticated on purpose: a load balancer or orchestrator has no way to
+	// hold API_ACCESS_KEY, and a probe that 401s reads as an unhealthy instance
+	// and gets restarted. It is registered as its own exact pattern, so it is
+	// outside the /api/ subtree the auth gate is mounted on — not a route the
+	// gate happens to allow through, but one the gate never sees. It discloses
+	// nothing beyond the fact that a process is listening.
+	//
+	// It deliberately does NOT touch the database. A probe that failed whenever
+	// Postgres was briefly slow would restart a server that was working, drop
+	// the webhook deliveries in flight, and take longer to come back than the
+	// blip it was reacting to — turning a slow query into an outage. What this
+	// answers is "is this process alive and serving", which is the question a
+	// liveness probe is asking. Readiness — "can this instance do useful work"
+	// — is a different question needing a different endpoint, and adding one
+	// means deciding what a degraded-but-serving instance should report; that
+	// is not built.
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintln(w, `{"status":"ok"}`)
+	})
+
 	// The JSON API, mounted as a subtree so its CORS headers apply to every
 	// /api/ route and to nothing else. The webhook above is called by
 	// Razorpay, not by a browser, and has no business advertising an allowed
