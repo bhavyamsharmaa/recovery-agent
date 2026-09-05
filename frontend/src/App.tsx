@@ -4,6 +4,7 @@ import ControlPanel from './components/ControlPanel'
 import EscalationQueue from './components/EscalationQueue'
 import PaymentDetail from './components/PaymentDetail'
 import PaymentsFeed from './components/PaymentsFeed'
+import SectionNav from './components/SectionNav'
 
 /**
  * Two views, switched by a piece of state.
@@ -28,15 +29,34 @@ export default function App() {
         </div>
       </header>
 
+      {/* Only on the feed view. The detail view is one panel with its own back
+          link, so jump links there would point at sections that are not on
+          screen. */}
+      {selected === null && <SectionNav />}
+
       <main className="mx-auto max-w-6xl px-4 py-8 sm:px-6">
         {selected === null ? (
           // The summary sits above the feed, not beside or below it: it is the
           // screen's headline answer, and the feed is the evidence behind it.
+          //
+          // Each section is wrapped in a div carrying the anchor id rather than
+          // the id being added to the components themselves: the nav is a thing
+          // laid over this layout, and a component should not have to know it
+          // is being linked to. scroll-mt-14 offsets the sticky bar's height so
+          // a jumped-to heading lands below it rather than beneath it.
           <div className="flex flex-col gap-8">
-            <BatchSummary />
-            <ControlPanel />
-            <EscalationQueue />
-            <PaymentsFeed onSelect={setSelected} />
+            <div id="batch-summary" className="scroll-mt-14">
+              <BatchSummary />
+            </div>
+            <div id="control-panel" className="scroll-mt-14">
+              <ControlPanel />
+            </div>
+            <div id="escalation-queue" className="scroll-mt-14">
+              <EscalationQueue />
+            </div>
+            <div id="payments-feed" className="scroll-mt-14">
+              <PaymentsFeed onSelect={setSelected} />
+            </div>
           </div>
         ) : (
           <PaymentDetail paymentId={selected} onBack={() => setSelected(null)} />
